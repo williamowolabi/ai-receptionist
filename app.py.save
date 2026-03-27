@@ -1,0 +1,24 @@
+from flask import Flask, request
+from twilio.twiml.voice_response import VoiceResponse
+
+app = Flask(__name__)
+
+@app.route("/voice", methods=["POST"])
+def voice():
+    response = VoiceResponse()
+    
+    response.say("Thanks for calling. How can I help you today?")
+    response.record(max_length=5, action="/handle-recording")
+
+    return str(response)
+
+@app.route("/handle-recording", methods=["POST"])
+def handle_recording():
+    response = VoiceResponse()
+    
+    response.say("Got it. We will contact you shortly. Thank you.")
+    
+    return str(response)
+
+if __name__ == "__main__":
+    app.run(port=5000)
