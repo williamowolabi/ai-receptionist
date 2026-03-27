@@ -11,6 +11,17 @@ import os
 
 app = Flask(__name__)
 
+@app.route("/")
+def home():
+    return "AI Receptionist is live"
+
+account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+twilio_number = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
+your_phone = os.getenv("YOUR_PHONE_NUMBER", "").strip()
+
+client = Client(account_sid, auth_token)
+
 # Better: use environment variables instead of hardcoding secrets
 account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
 auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
