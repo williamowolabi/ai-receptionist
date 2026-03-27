@@ -2,12 +2,14 @@
 # coding: utf-8
 
 # In[1]:
-
-from flask import Flask, request
+from flask import Flask, request, send_file
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.rest import Client
 from urllib.parse import quote
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import os
+import csv
 
 app = Flask(__name__)
 
@@ -20,11 +22,50 @@ auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 twilio_number = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
 your_phone = os.getenv("YOUR_PHONE_NUMBER", "").strip()
 
-client = Client(account_sid, auth_token)
+client = Client(account_sid, auth_token) if account_sid and auth_token else None
+
+# Render persistent disk path
+DATA_FILE = "/var/data/calls.csv"
 
 
 def clean_speech():
     return request.form.get("SpeechResult", "").strip()
+
+
+def ensure_csv_exists():
+    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+
+    if not os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "call_time",
+                "caller_phone",
+                "service",
+                "customer_name",
+                "details"
+            ])
+
+
+def save_call(caller_phone, service, customer_name, details):
+    ensure_csv_exists()
+    call_time = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S")
+
+    with open(DATA_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            call_time,
+            caller_phone,
+            service,
+            customer_name,
+            details
+        ])
+
+
+@app.route("/download-calls")
+def download_calls():
+    ensure_csv_exists()
+    return send_file(DATA_FILE, as_attachment=True)
 
 
 # STEP 1: Greeting
@@ -52,8 +93,6 @@ def confirm_service():
     service = clean_speech() or "service needed"
     safe_service = quote(service)
 
-    print("CAPTURED SERVICE:", service)
-
     response = VoiceResponse()
     gather = Gather(
         input="speech",
@@ -73,9 +112,6 @@ def confirm_service():
 def handle_service_confirmation():
     service = request.args.get("service", "service needed")
     confirmation = clean_speech().lower()
-
-    print("SERVICE CONFIRMATION:", confirmation)
-
     response = VoiceResponse()
 
     if "yes" in confirmation:
@@ -129,8 +165,6 @@ def confirm_name():
     safe_service = quote(service)
     safe_name = quote(name)
 
-    print("CAPTURED NAME:", name)
-
     response = VoiceResponse()
     gather = Gather(
         input="speech",
@@ -151,9 +185,6 @@ def handle_name_confirmation():
     service = request.args.get("service", "service needed")
     name = request.args.get("name", "customer")
     confirmation = clean_speech().lower()
-
-    print("NAME CONFIRMATION:", confirmation)
-
     response = VoiceResponse()
 
     if "yes" in confirmation:
@@ -218,8 +249,6 @@ def confirm_details():
     safe_name = quote(name)
     safe_details = quote(details)
 
-    print("CAPTURED DETAILS:", details)
-
     response = VoiceResponse()
     gather = Gather(
         input="speech",
@@ -242,27 +271,33 @@ def handle_details_confirmation():
     details = request.args.get("details", "not specified")
     confirmation = clean_speech().lower()
 
-    print("DETAILS CONFIRMATION:", confirmation)
-
     response = VoiceResponse()
 
     if "yes" in confirmation:
+        caller_phone = request.form.get("From", "unknown")
+
+        save_call(caller_phone, service, name, details)
+
         message_body = (
             f"New Lead:\n"
+            f"Time: {datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"Name: {name}\n"
+            f"Phone: {caller_phone}\n"
             f"Service: {service}\n"
             f"Details: {details}"
         )
 
         try:
-            client.messages.create(
-                body=message_body,
-                from_=twilio_number,
-                to=your_phone
-            )
-            print("✅ SMS SENT")
+            if client and twilio_number and your_phone:
+                client.messages.create(
+                    body=message_body,
+                    from_=twilio_number,
+                    to=your_phone
+                )
+            else:
+                print("SMS skipped: missing Twilio environment variables")
         except Exception as e:
-            print("❌ SMS ERROR:", e)
+            print("SMS ERROR:", e)
 
         response.say(
             f"Thanks {name}. I’ve got everything I need. "
@@ -307,4 +342,5 @@ def handle_details_confirmation():
 
 
 if __name__ == "__main__":
+    ensure_csv_exists()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
