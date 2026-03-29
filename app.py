@@ -2,77 +2,21 @@
 # coding: utf-8
 
 # In[1]:from flask import Flask, request, send_file
-from flask import Flask, request, send_file
+from flask import Flask, request
 from twilio.twiml.voice_response import VoiceResponse, Gather
-from twilio.rest import Client
-from urllib.parse import quote
-from datetime import datetime
-from zoneinfo import ZoneInfo
 import os
 import csv
+from datetime import datetime
 
 app = Flask(__name__)
 
-@app.route("/")
-def home():
-    return "AI Receptionist is live"
-
-
-account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
-auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
-twilio_number = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
-your_phone = os.getenv("YOUR_PHONE_NUMBER", "").strip()
-
-client = Client(account_sid, auth_token) if account_sid and auth_token else None
-
-# Local + Render-safe CSV path
-DATA_FILE = os.getenv("DATA_FILE", os.path.join(os.getcwd(), "calls.csv"))
-
-# Voice settings
-AI_VOICE = "Polly.Joanna-Generative"
-AI_LANGUAGE = "en-US"
-
-
-def clean_speech():
-    return request.form.get("SpeechResult", "").strip()
-
-
-def say_gather(gather, text):
-    gather.say(text, voice=AI_VOICE, language=AI_LANGUAGE)
-
-
-def say_response(response, text):
-    response.say(text, voice=AI_VOICE, language=AI_LANGUAGE)
-
-
-def normalize_service(service):
-    service = service.strip()
-
-    prefixes = [
-        "i need ",
-        "i need a ",
-        "i need an ",
-        "i'm calling about ",
-        "im calling about ",
-        "calling about ",
-        "i have a ",
-        "i have an ",
-        "i have ",
-        "need ",
-        "looking for ",
-        "i'm looking for ",
-        "im looking for "
-    ]
-
-    lower_service = service.lower()
-    for prefix in prefixes:
-        if lower_service.startswith(prefix):
-            return service[len(prefix):].strip()
-
-    return service
+# On Render, /var/data exists if you mounted a persistent disk there.
+# Locally, it will save calls.csv in your project folder.
+DATA_FILE = "/var/data/calls.csv" if os.path.exists("/var/data") else "calls.csv"
 
 
 def ensure_csv_exists():
+    """Create the CSV file with headers if it does not already exist."""
     folder = os.path.dirname(DATA_FILE)
     if folder:
         os.makedirs(folder, exist_ok=True)
@@ -81,312 +25,238 @@ def ensure_csv_exists():
         with open(DATA_FILE, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "call_time",
-                "caller_phone",
+                "timestamp",
+                "caller",
                 "service",
-                "customer_name",
+                "intent",
+                "urgency",
                 "details"
             ])
 
 
-def save_call(caller_phone, service, customer_name, details):
-    ensure_csv_exists()
-    call_time = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S")
-
+def append_to_csv(caller, service, intent, urgency, details):
+    """Append one completed call row to the CSV."""
     with open(DATA_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
-            call_time,
-            caller_phone,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            caller,
             service,
-            customer_name,
+            intent,
+            urgency,
             details
         ])
 
 
-@app.route("/download-calls")
-def download_calls():
-    ensure_csv_exists()
-    return send_file(DATA_FILE, as_attachment=True)
+def clean_text(value):
+    """Safely clean speech input."""
+    if not value:
+        return ""
+    return value.strip()
 
 
-# STEP 1: Greeting
-@app.route("/voice", methods=["POST", "GET"])
+@app.route("/", methods=["GET"])
+def home():
+    return "AI Receptionist is running."
+
+
+@app.route("/voice", methods=["GET", "POST"])
 def voice():
+    """Initial incoming call route."""
     response = VoiceResponse()
 
     gather = Gather(
         input="speech",
-        action="/confirm_service",
+        action="/get_service",
         method="POST",
-        speech_timeout="auto",
-        timeout=5
+        speech_timeout="auto"
     )
-    say_gather(gather, "Hello, thanks for calling. How can I help you today?")
+    gather.say(
+        "Thank you for calling. Please tell me what kind of service you need today, "
+        "such as plumbing, HVAC, electrical, roofing, or something else."
+    )
     response.append(gather)
 
-    say_response(response, "Sorry, I didn’t catch that. Please call again.")
+    response.redirect("/voice")
     return str(response)
 
 
-# STEP 2: Confirm service
-@app.route("/confirm_service", methods=["POST", "GET"])
+@app.route("/get_service", methods=["POST"])
+def get_service():
+    """Capture the requested service and ask for yes/no confirmation."""
+    response = VoiceResponse()
+
+    service = clean_text(request.values.get("SpeechResult"))
+    caller = request.values.get("From", "Unknown")
+
+    if not service:
+        gather = Gather(
+            input="speech",
+            action="/get_service",
+            method="POST",
+            speech_timeout="auto"
+        )
+        gather.say("I did not catch that. Please say the type of service you need.")
+        response.append(gather)
+        response.redirect("/voice")
+        return str(response)
+
+    gather = Gather(
+        input="speech",
+        action=f"/confirm_service?service={service}&caller={caller}",
+        method="POST",
+        speech_timeout="auto"
+    )
+    gather.say(f"Just to confirm, you need {service}. Is that correct? Please say yes or no.")
+    response.append(gather)
+
+    response.redirect(f"/get_service")
+    return str(response)
+
+
+@app.route("/confirm_service", methods=["POST"])
 def confirm_service():
-    raw_service = clean_speech() or "service needed"
-    service = normalize_service(raw_service) or "service needed"
-    safe_service = quote(service)
-
+    """Handle yes/no confirmation for service."""
     response = VoiceResponse()
+
+    answer = clean_text(request.values.get("SpeechResult")).lower()
+    service = request.args.get("service", "")
+    caller = request.args.get("caller", "Unknown")
+
+    if "yes" in answer:
+        gather = Gather(
+            input="speech",
+            action=f"/get_intent?service={service}&caller={caller}",
+            method="POST",
+            speech_timeout="auto"
+        )
+        gather.say("Great. Please briefly tell me what you need help with.")
+        response.append(gather)
+        response.redirect(f"/confirm_service?service={service}&caller={caller}")
+        return str(response)
+
+    if "no" in answer:
+        gather = Gather(
+            input="speech",
+            action="/get_service",
+            method="POST",
+            speech_timeout="auto"
+        )
+        gather.say("No problem. Please say the type of service you need again.")
+        response.append(gather)
+        response.redirect("/voice")
+        return str(response)
+
     gather = Gather(
         input="speech",
-        action=f"/handle_service_confirmation?service={safe_service}",
+        action=f"/confirm_service?service={service}&caller={caller}",
         method="POST",
-        speech_timeout="auto",
-        timeout=5
+        speech_timeout="auto"
     )
-    say_gather(gather, f"Just to confirm, you need {service}. Is that right?")
+    gather.say("Please say yes or no. Is that service correct?")
     response.append(gather)
-
-    say_response(response, "Sorry, I didn’t catch that. Please say yes or no.")
+    response.redirect(f"/confirm_service?service={service}&caller={caller}")
     return str(response)
 
 
-@app.route("/handle_service_confirmation", methods=["POST", "GET"])
-def handle_service_confirmation():
-    service = request.args.get("service", "service needed")
-    confirmation = clean_speech().lower()
+@app.route("/get_intent", methods=["POST"])
+def get_intent():
+    """Capture what the caller needs help with."""
     response = VoiceResponse()
 
-    if "yes" in confirmation:
-        safe_service = quote(service)
+    intent = clean_text(request.values.get("SpeechResult"))
+    service = request.args.get("service", "")
+    caller = request.args.get("caller", "Unknown")
+
+    if not intent:
         gather = Gather(
             input="speech",
-            action=f"/confirm_name?service={safe_service}",
+            action=f"/get_intent?service={service}&caller={caller}",
             method="POST",
-            speech_timeout="auto",
-            timeout=5
+            speech_timeout="auto"
         )
-        say_gather(gather, "Got it. Can I get your name?")
+        gather.say("I did not catch that. Please briefly tell me what you need help with.")
         response.append(gather)
-
-        say_response(response, "Sorry, I didn’t catch your name.")
+        response.redirect(f"/get_intent?service={service}&caller={caller}")
         return str(response)
 
-    elif "no" in confirmation:
-        gather = Gather(
-            input="speech",
-            action="/confirm_service",
-            method="POST",
-            speech_timeout="auto",
-            timeout=5
-        )
-        say_gather(gather, "Okay, let’s try that again. What service do you need?")
-        response.append(gather)
-
-        say_response(response, "Sorry, I didn’t catch that.")
-        return str(response)
-
-    else:
-        safe_service = quote(service)
-        gather = Gather(
-            input="speech",
-            action=f"/handle_service_confirmation?service={safe_service}",
-            method="POST",
-            speech_timeout="auto",
-            timeout=5
-        )
-        say_gather(gather, "Please say yes or no.")
-        response.append(gather)
-
-        say_response(response, "Sorry, I didn’t catch that.")
-        return str(response)
-
-
-# STEP 3: Confirm name
-@app.route("/confirm_name", methods=["POST", "GET"])
-def confirm_name():
-    service = request.args.get("service", "service needed")
-    name = clean_speech() or "customer"
-
-    safe_service = quote(service)
-    safe_name = quote(name)
-
-    response = VoiceResponse()
     gather = Gather(
         input="speech",
-        action=f"/handle_name_confirmation?service={safe_service}&name={safe_name}",
+        action=f"/get_urgency?service={service}&intent={intent}&caller={caller}",
         method="POST",
-        speech_timeout="auto",
-        timeout=5
+        speech_timeout="auto"
     )
-    say_gather(gather, f"You said your name is {name}. Is that correct?")
+    gather.say("Is this urgent? Please say yes or no.")
     response.append(gather)
 
-    say_response(response, "Sorry, I didn’t catch that. Please say yes or no.")
+    response.redirect(f"/get_intent?service={service}&caller={caller}")
     return str(response)
 
 
-@app.route("/handle_name_confirmation", methods=["POST", "GET"])
-def handle_name_confirmation():
-    service = request.args.get("service", "service needed")
-    name = request.args.get("name", "customer")
-    confirmation = clean_speech().lower()
+@app.route("/get_urgency", methods=["POST"])
+def get_urgency():
+    """Capture urgency as yes/no."""
     response = VoiceResponse()
 
-    if "yes" in confirmation:
-        safe_service = quote(service)
-        safe_name = quote(name)
+    answer = clean_text(request.values.get("SpeechResult")).lower()
+    service = request.args.get("service", "")
+    intent = request.args.get("intent", "")
+    caller = request.args.get("caller", "Unknown")
 
-        gather = Gather(
-            input="speech",
-            action=f"/confirm_details?service={safe_service}&name={safe_name}",
-            method="POST",
-            speech_timeout="auto",
-            timeout=5
-        )
-        say_gather(gather, f"Thanks, {name}. Can you tell me a little more about what you need?")
-        response.append(gather)
-
-        say_response(response, "Sorry, I didn’t catch that.")
-        return str(response)
-
-    elif "no" in confirmation:
-        safe_service = quote(service)
-
-        gather = Gather(
-            input="speech",
-            action=f"/confirm_name?service={safe_service}",
-            method="POST",
-            speech_timeout="auto",
-            timeout=5
-        )
-        say_gather(gather, "Okay, let’s try again. Please say your name.")
-        response.append(gather)
-
-        say_response(response, "Sorry, I didn’t catch that.")
-        return str(response)
-
+    if "yes" in answer:
+        urgency = "Urgent"
+    elif "no" in answer:
+        urgency = "Not Urgent"
     else:
-        safe_service = quote(service)
-        safe_name = quote(name)
-
         gather = Gather(
             input="speech",
-            action=f"/handle_name_confirmation?service={safe_service}&name={safe_name}",
+            action=f"/get_urgency?service={service}&intent={intent}&caller={caller}",
             method="POST",
-            speech_timeout="auto",
-            timeout=5
+            speech_timeout="auto"
         )
-        say_gather(gather, "Please say yes or no.")
+        gather.say("Please say yes or no. Is this urgent?")
         response.append(gather)
-
-        say_response(response, "Sorry, I didn’t catch that.")
+        response.redirect(f"/get_urgency?service={service}&intent={intent}&caller={caller}")
         return str(response)
 
-
-# STEP 4: Confirm details
-@app.route("/confirm_details", methods=["POST", "GET"])
-def confirm_details():
-    service = request.args.get("service", "service needed")
-    name = request.args.get("name", "customer")
-    details = clean_speech() or "not specified"
-
-    safe_service = quote(service)
-    safe_name = quote(name)
-    safe_details = quote(details)
-
-    response = VoiceResponse()
     gather = Gather(
         input="speech",
-        action=f"/handle_details_confirmation?service={safe_service}&name={safe_name}&details={safe_details}",
+        action=f"/get_details?service={service}&intent={intent}&urgency={urgency}&caller={caller}",
         method="POST",
-        speech_timeout="auto",
-        timeout=5
+        speech_timeout="auto"
     )
-    say_gather(gather, f"Just to confirm, you said {details}. Is that correct?")
+    gather.say("Please share any extra details you want us to know.")
     response.append(gather)
 
-    say_response(response, "Sorry, I didn’t catch that. Please say yes or no.")
+    response.redirect(f"/get_urgency?service={service}&intent={intent}&caller={caller}")
     return str(response)
 
 
-@app.route("/handle_details_confirmation", methods=["POST", "GET"])
-def handle_details_confirmation():
-    service = request.args.get("service", "service needed")
-    name = request.args.get("name", "customer")
-    details = request.args.get("details", "not specified")
-    confirmation = clean_speech().lower()
-
+@app.route("/get_details", methods=["POST"])
+def get_details():
+    """Capture extra details and save everything to CSV."""
     response = VoiceResponse()
 
-    if "yes" in confirmation:
-        caller_phone = request.form.get("From", "unknown")
+    details = clean_text(request.values.get("SpeechResult"))
+    service = request.args.get("service", "")
+    intent = request.args.get("intent", "")
+    urgency = request.args.get("urgency", "")
+    caller = request.args.get("caller", "Unknown")
 
-        save_call(caller_phone, service, name, details)
+    if not details:
+        details = "No extra details provided"
 
-        message_body = (
-            f"New Lead:\n"
-            f"Time: {datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"Name: {name}\n"
-            f"Phone: {caller_phone}\n"
-            f"Service: {service}\n"
-            f"Details: {details}"
-        )
+    append_to_csv(caller, service, intent, urgency, details)
 
-        try:
-            if client and twilio_number and your_phone:
-                client.messages.create(
-                    body=message_body,
-                    from_=twilio_number,
-                    to=your_phone
-                )
-            else:
-                print("SMS skipped: missing Twilio environment variables")
-        except Exception as e:
-            print("SMS ERROR:", e)
-
-        say_response(
-            response,
-            f"Thanks, {name}. I’ve got everything I need. Someone will reach out to you shortly."
-        )
-        return str(response)
-
-    elif "no" in confirmation:
-        safe_service = quote(service)
-        safe_name = quote(name)
-
-        gather = Gather(
-            input="speech",
-            action=f"/confirm_details?service={safe_service}&name={safe_name}",
-            method="POST",
-            speech_timeout="auto",
-            timeout=5
-        )
-        say_gather(gather, "Okay, let’s try again. Please tell me a little more about what you need.")
-        response.append(gather)
-
-        say_response(response, "Sorry, I didn’t catch that.")
-        return str(response)
-
-    else:
-        safe_service = quote(service)
-        safe_name = quote(name)
-        safe_details = quote(details)
-
-        gather = Gather(
-            input="speech",
-            action=f"/handle_details_confirmation?service={safe_service}&name={safe_name}&details={safe_details}",
-            method="POST",
-            speech_timeout="auto",
-            timeout=5
-        )
-        say_gather(gather, "Please say yes or no.")
-        response.append(gather)
-
-        say_response(response, "Sorry, I didn’t catch that.")
-        return str(response)
+    response.say(
+        f"Thank you. We have your request for {service}. "
+        "Someone will follow up with you soon. Goodbye."
+    )
+    response.hangup()
+    return str(response)
 
 
 if __name__ == "__main__":
     ensure_csv_exists()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
