@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
-from flask import Flask, request, send_file
+# In[1]:from flask import Flask, request, send_file
+from flask import Flask, request
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.rest import Client
 from urllib.parse import quote
@@ -13,10 +13,6 @@ import csv
 
 app = Flask(__name__)
 
-@app.route("/")
-def home():
-    return "AI Receptionist is live"
-
 account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
 auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 twilio_number = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
@@ -24,12 +20,26 @@ your_phone = os.getenv("YOUR_PHONE_NUMBER", "").strip()
 
 client = Client(account_sid, auth_token) if account_sid and auth_token else None
 
-# Render persistent disk path
-DATA_FILE = "/var/data/calls.csv"
+DATA_FILE = os.getenv("DATA_FILE", os.path.join(os.getcwd(), "calls.csv"))
+
+AI_VOICE = "Polly.Joanna-Generative"
+AI_LANGUAGE = "en-US"
+
+# Voice settings
+AI_VOICE = "Polly.Joanna-Generative"
+AI_LANGUAGE = "en-US"
 
 
 def clean_speech():
     return request.form.get("SpeechResult", "").strip()
+
+
+def say_gather(gather, text):
+    gather.say(text, voice=AI_VOICE, language=AI_LANGUAGE)
+
+
+def say_response(response, text):
+    response.say(text, voice=AI_VOICE, language=AI_LANGUAGE)
 
 
 def ensure_csv_exists():
@@ -80,10 +90,10 @@ def voice():
         speech_timeout="auto",
         timeout=5
     )
-    gather.say("Hello. Thanks for calling. How can I help you today?")
+    say_gather(gather, "Hello. Thanks for calling. How can I help you today?")
     response.append(gather)
 
-    response.say("Sorry, I didn’t catch that. Please call again.")
+    say_response(response, "Sorry, I didn’t catch that. Please call again.")
     return str(response)
 
 
@@ -101,10 +111,10 @@ def confirm_service():
         speech_timeout="auto",
         timeout=5
     )
-    gather.say(f"You said {service}. Is that correct? Please say yes or no.")
+    say_gather(gather, f"You said {service}. Is that correct? Please say yes or no.")
     response.append(gather)
 
-    response.say("Sorry, I didn’t catch that. Please say yes or no.")
+    say_response(response, "Sorry, I didn’t catch that. Please say yes or no.")
     return str(response)
 
 
@@ -123,9 +133,9 @@ def handle_service_confirmation():
             speech_timeout="auto",
             timeout=5
         )
-        gather.say("Got it. And can I get your name?")
+        say_gather(gather, "Got it. And can I get your name?")
         response.append(gather)
-        response.say("Sorry, I didn’t catch your name.")
+        say_response(response, "Sorry, I didn’t catch your name.")
         return str(response)
 
     elif "no" in confirmation:
@@ -136,9 +146,9 @@ def handle_service_confirmation():
             speech_timeout="auto",
             timeout=5
         )
-        gather.say("Okay, let’s try again. How can I help you today?")
+        say_gather(gather, "Okay, let’s try again. How can I help you today?")
         response.append(gather)
-        response.say("Sorry, I didn’t catch that.")
+        say_response(response, "Sorry, I didn’t catch that.")
         return str(response)
 
     else:
@@ -150,9 +160,9 @@ def handle_service_confirmation():
             speech_timeout="auto",
             timeout=5
         )
-        gather.say("Please say yes or no.")
+        say_gather(gather, "Please say yes or no.")
         response.append(gather)
-        response.say("Sorry, I didn’t catch that.")
+        say_response(response, "Sorry, I didn’t catch that.")
         return str(response)
 
 
@@ -173,10 +183,10 @@ def confirm_name():
         speech_timeout="auto",
         timeout=5
     )
-    gather.say(f"You said your name is {name}. Is that correct? Please say yes or no.")
+    say_gather(gather, f"You said your name is {name}. Is that correct? Please say yes or no.")
     response.append(gather)
 
-    response.say("Sorry, I didn’t catch that. Please say yes or no.")
+    say_response(response, "Sorry, I didn’t catch that. Please say yes or no.")
     return str(response)
 
 
@@ -198,10 +208,10 @@ def handle_name_confirmation():
             speech_timeout="auto",
             timeout=5
         )
-        gather.say(f"Thanks {name}. Can you tell me a little more about what you need?")
+        say_gather(gather, f"Thanks {name}. Can you tell me a little more about what you need?")
         response.append(gather)
 
-        response.say("Sorry, I didn’t catch that.")
+        say_response(response, "Sorry, I didn’t catch that.")
         return str(response)
 
     elif "no" in confirmation:
@@ -214,10 +224,10 @@ def handle_name_confirmation():
             speech_timeout="auto",
             timeout=5
         )
-        gather.say("Okay, let’s try again. Please say your name.")
+        say_gather(gather, "Okay, let’s try again. Please say your name.")
         response.append(gather)
 
-        response.say("Sorry, I didn’t catch that.")
+        say_response(response, "Sorry, I didn’t catch that.")
         return str(response)
 
     else:
@@ -231,10 +241,10 @@ def handle_name_confirmation():
             speech_timeout="auto",
             timeout=5
         )
-        gather.say("Please say yes or no.")
+        say_gather(gather, "Please say yes or no.")
         response.append(gather)
 
-        response.say("Sorry, I didn’t catch that.")
+        say_response(response, "Sorry, I didn’t catch that.")
         return str(response)
 
 
@@ -257,10 +267,10 @@ def confirm_details():
         speech_timeout="auto",
         timeout=5
     )
-    gather.say(f"You said {details}. Is that correct? Please say yes or no.")
+    say_gather(gather, f"You said {details}. Is that correct? Please say yes or no.")
     response.append(gather)
 
-    response.say("Sorry, I didn’t catch that. Please say yes or no.")
+    say_response(response, "Sorry, I didn’t catch that. Please say yes or no.")
     return str(response)
 
 
@@ -299,9 +309,9 @@ def handle_details_confirmation():
         except Exception as e:
             print("SMS ERROR:", e)
 
-        response.say(
-            f"Thanks {name}. I’ve got everything I need. "
-            "Someone will reach out to you shortly."
+        say_response(
+            response,
+            f"Thanks {name}. I’ve got everything I need. Someone will reach out to you shortly."
         )
         return str(response)
 
@@ -316,10 +326,10 @@ def handle_details_confirmation():
             speech_timeout="auto",
             timeout=5
         )
-        gather.say("Okay, let’s try again. Please tell me a little more about what you need.")
+        say_gather(gather, "Okay, let’s try again. Please tell me a little more about what you need.")
         response.append(gather)
 
-        response.say("Sorry, I didn’t catch that.")
+        say_response(response, "Sorry, I didn’t catch that.")
         return str(response)
 
     else:
@@ -334,10 +344,10 @@ def handle_details_confirmation():
             speech_timeout="auto",
             timeout=5
         )
-        gather.say("Please say yes or no.")
+        say_gather(gather, "Please say yes or no.")
         response.append(gather)
 
-        response.say("Sorry, I didn’t catch that.")
+        say_response(response, "Sorry, I didn’t catch that.")
         return str(response)
 
 
