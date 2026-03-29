@@ -2,7 +2,7 @@
 # coding: utf-8
 
 # In[1]:from flask import Flask, request, send_file
-from flask import Flask, request
+from flask import Flask, request, send_file
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.rest import Client
 from urllib.parse import quote
@@ -13,6 +13,11 @@ import csv
 
 app = Flask(__name__)
 
+@app.route("/")
+def home():
+    return "AI Receptionist is live"
+
+
 account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
 auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 twilio_number = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
@@ -20,10 +25,8 @@ your_phone = os.getenv("YOUR_PHONE_NUMBER", "").strip()
 
 client = Client(account_sid, auth_token) if account_sid and auth_token else None
 
+# Local + Render-safe CSV path
 DATA_FILE = os.getenv("DATA_FILE", os.path.join(os.getcwd(), "calls.csv"))
-
-AI_VOICE = "Polly.Joanna-Generative"
-AI_LANGUAGE = "en-US"
 
 # Voice settings
 AI_VOICE = "Polly.Joanna-Generative"
@@ -42,8 +45,37 @@ def say_response(response, text):
     response.say(text, voice=AI_VOICE, language=AI_LANGUAGE)
 
 
+def normalize_service(service):
+    service = service.strip()
+
+    prefixes = [
+        "i need ",
+        "i need a ",
+        "i need an ",
+        "i'm calling about ",
+        "im calling about ",
+        "calling about ",
+        "i have a ",
+        "i have an ",
+        "i have ",
+        "need ",
+        "looking for ",
+        "i'm looking for ",
+        "im looking for "
+    ]
+
+    lower_service = service.lower()
+    for prefix in prefixes:
+        if lower_service.startswith(prefix):
+            return service[len(prefix):].strip()
+
+    return service
+
+
 def ensure_csv_exists():
-    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+    folder = os.path.dirname(DATA_FILE)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
 
     if not os.path.exists(DATA_FILE):
         with open(DATA_FILE, "w", newline="", encoding="utf-8") as f:
@@ -90,7 +122,7 @@ def voice():
         speech_timeout="auto",
         timeout=5
     )
-    say_gather(gather, "Hello. Thanks for calling. How can I help you today?")
+    say_gather(gather, "Hello, thanks for calling. How can I help you today?")
     response.append(gather)
 
     say_response(response, "Sorry, I didn’t catch that. Please call again.")
@@ -100,7 +132,8 @@ def voice():
 # STEP 2: Confirm service
 @app.route("/confirm_service", methods=["POST", "GET"])
 def confirm_service():
-    service = clean_speech() or "service needed"
+    raw_service = clean_speech() or "service needed"
+    service = normalize_service(raw_service) or "service needed"
     safe_service = quote(service)
 
     response = VoiceResponse()
@@ -111,7 +144,7 @@ def confirm_service():
         speech_timeout="auto",
         timeout=5
     )
-    say_gather(gather, f"You said {service}. Is that correct? Please say yes or no.")
+    say_gather(gather, f"Just to confirm, you need {service}. Is that right?")
     response.append(gather)
 
     say_response(response, "Sorry, I didn’t catch that. Please say yes or no.")
@@ -133,8 +166,9 @@ def handle_service_confirmation():
             speech_timeout="auto",
             timeout=5
         )
-        say_gather(gather, "Got it. And can I get your name?")
+        say_gather(gather, "Got it. Can I get your name?")
         response.append(gather)
+
         say_response(response, "Sorry, I didn’t catch your name.")
         return str(response)
 
@@ -146,8 +180,9 @@ def handle_service_confirmation():
             speech_timeout="auto",
             timeout=5
         )
-        say_gather(gather, "Okay, let’s try again. How can I help you today?")
+        say_gather(gather, "Okay, let’s try that again. What service do you need?")
         response.append(gather)
+
         say_response(response, "Sorry, I didn’t catch that.")
         return str(response)
 
@@ -162,6 +197,7 @@ def handle_service_confirmation():
         )
         say_gather(gather, "Please say yes or no.")
         response.append(gather)
+
         say_response(response, "Sorry, I didn’t catch that.")
         return str(response)
 
@@ -183,7 +219,7 @@ def confirm_name():
         speech_timeout="auto",
         timeout=5
     )
-    say_gather(gather, f"You said your name is {name}. Is that correct? Please say yes or no.")
+    say_gather(gather, f"You said your name is {name}. Is that correct?")
     response.append(gather)
 
     say_response(response, "Sorry, I didn’t catch that. Please say yes or no.")
@@ -208,7 +244,7 @@ def handle_name_confirmation():
             speech_timeout="auto",
             timeout=5
         )
-        say_gather(gather, f"Thanks {name}. Can you tell me a little more about what you need?")
+        say_gather(gather, f"Thanks, {name}. Can you tell me a little more about what you need?")
         response.append(gather)
 
         say_response(response, "Sorry, I didn’t catch that.")
@@ -267,7 +303,7 @@ def confirm_details():
         speech_timeout="auto",
         timeout=5
     )
-    say_gather(gather, f"You said {details}. Is that correct? Please say yes or no.")
+    say_gather(gather, f"Just to confirm, you said {details}. Is that correct?")
     response.append(gather)
 
     say_response(response, "Sorry, I didn’t catch that. Please say yes or no.")
@@ -311,7 +347,7 @@ def handle_details_confirmation():
 
         say_response(
             response,
-            f"Thanks {name}. I’ve got everything I need. Someone will reach out to you shortly."
+            f"Thanks, {name}. I’ve got everything I need. Someone will reach out to you shortly."
         )
         return str(response)
 
