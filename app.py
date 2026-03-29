@@ -1,4 +1,4 @@
-from flask import Flask, request
+from flask import Flask, request, send_file
 from twilio.twiml.voice_response import VoiceResponse, Gather
 import os
 import csv
@@ -57,6 +57,7 @@ def ensure_csv_exists():
             writer = csv.writer(f)
             writer.writerow([
                 "timestamp",
+                "name",
                 "caller",
                 "service",
                 "intent",
@@ -65,9 +66,10 @@ def ensure_csv_exists():
             ])
 
 
-def append_to_csv(caller, service, intent, urgency, details):
+def append_to_csv(name, caller, service, intent, urgency, details):
     print("append_to_csv called")
     print("Saving to:", DATA_FILE)
+    print("name =", name)
     print("caller =", caller)
     print("service =", service)
     print("intent =", intent)
@@ -78,6 +80,7 @@ def append_to_csv(caller, service, intent, urgency, details):
         writer = csv.writer(f)
         writer.writerow([
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            name,
             caller,
             service,
             intent,
@@ -88,20 +91,21 @@ def append_to_csv(caller, service, intent, urgency, details):
     print("Row written successfully")
 
 
-@app.route("/")
+ensure_csv_exists()
+
+
+@app.route("/", methods=["GET"])
 def home():
-    return "AI Receptionist is running." 
+    return "AI Receptionist is running."
 
 
 @app.route("/voice", methods=["GET", "POST"])
 def voice():
     response = VoiceResponse()
 
-    gather = gather_speech("/get_service")
+    gather = gather_speech("/get_name")
     gather.say(
-        "Thank you for calling. You’ve reached the service desk. "
-        "Please tell me what type of service you need today, "
-        "like plumbing, HVAC, electrical, roofing, or something else.",
+        "Thank you for calling. You’ve reached the service desk. May I have your full name please?",
         voice=VOICE,
         language=LANGUAGE
     )
@@ -111,17 +115,17 @@ def voice():
     return str(response)
 
 
-@app.route("/get_service", methods=["POST"])
-def get_service():
+@app.route("/get_name", methods=["POST"])
+def get_name():
     response = VoiceResponse()
 
-    service = clean_text(request.values.get("SpeechResult"))
+    name = clean_text(request.values.get("SpeechResult"))
     caller = request.values.get("From", "Unknown")
 
-    if not service:
-        gather = gather_speech("/get_service")
+    if not name:
+        gather = gather_speech("/get_name")
         gather.say(
-            "I didn’t catch that. Please tell me the type of service you need.",
+            "I didn’t catch your name. Please say your full name.",
             voice=VOICE,
             language=LANGUAGE
         )
@@ -129,8 +133,40 @@ def get_service():
         response.redirect("/voice")
         return str(response)
 
-    confirm_url = build_url("/confirm_service", service=service, caller=caller)
+    next_url = build_url("/get_service", name=name, caller=caller)
+    gather = gather_speech(next_url)
+    gather.say(
+        f"Thank you {name}. Please tell me what type of service you need today, like plumbing, HVAC, electrical, roofing, or something else.",
+        voice=VOICE,
+        language=LANGUAGE
+    )
+    response.append(gather)
 
+    response.redirect(next_url)
+    return str(response)
+
+
+@app.route("/get_service", methods=["POST"])
+def get_service():
+    response = VoiceResponse()
+
+    service = clean_text(request.values.get("SpeechResult"))
+    name = request.args.get("name", "")
+    caller = request.args.get("caller", "Unknown")
+
+    if not service:
+        retry_url = build_url("/get_service", name=name, caller=caller)
+        gather = gather_speech(retry_url)
+        gather.say(
+            "I didn’t catch that. Please tell me the type of service you need.",
+            voice=VOICE,
+            language=LANGUAGE
+        )
+        response.append(gather)
+        response.redirect(retry_url)
+        return str(response)
+
+    confirm_url = build_url("/confirm_service", name=name, service=service, caller=caller)
     gather = gather_speech(confirm_url)
     gather.say(
         f"Just to make sure I heard you right, you need {service}. Please say yes or no.",
@@ -148,11 +184,12 @@ def confirm_service():
     response = VoiceResponse()
 
     answer = yes_no_answer(request.values.get("SpeechResult"))
+    name = request.args.get("name", "")
     service = request.args.get("service", "")
     caller = request.args.get("caller", "Unknown")
 
     if answer == "yes":
-        next_url = build_url("/get_intent", service=service, caller=caller)
+        next_url = build_url("/get_intent", name=name, service=service, caller=caller)
         gather = gather_speech(next_url)
         gather.say(
             "Great. Please briefly tell me what is going on and what you need help with.",
@@ -164,17 +201,18 @@ def confirm_service():
         return str(response)
 
     if answer == "no":
-        gather = gather_speech("/get_service")
+        next_url = build_url("/get_service", name=name, caller=caller)
+        gather = gather_speech(next_url)
         gather.say(
             "Okay, let’s try that again. Please tell me the type of service you need.",
             voice=VOICE,
             language=LANGUAGE
         )
         response.append(gather)
-        response.redirect("/voice")
+        response.redirect(next_url)
         return str(response)
 
-    retry_url = build_url("/confirm_service", service=service, caller=caller)
+    retry_url = build_url("/confirm_service", name=name, service=service, caller=caller)
     gather = gather_speech(retry_url)
     gather.say(
         "Please say yes or no. Do you need that service?",
@@ -191,11 +229,12 @@ def get_intent():
     response = VoiceResponse()
 
     intent = clean_text(request.values.get("SpeechResult"))
+    name = request.args.get("name", "")
     service = request.args.get("service", "")
     caller = request.args.get("caller", "Unknown")
 
     if not intent:
-        retry_url = build_url("/get_intent", service=service, caller=caller)
+        retry_url = build_url("/get_intent", name=name, service=service, caller=caller)
         gather = gather_speech(retry_url)
         gather.say(
             "I didn’t catch that. Please briefly tell me what you need help with.",
@@ -206,7 +245,7 @@ def get_intent():
         response.redirect(retry_url)
         return str(response)
 
-    next_url = build_url("/get_urgency", service=service, intent=intent, caller=caller)
+    next_url = build_url("/get_urgency", name=name, service=service, intent=intent, caller=caller)
     gather = gather_speech(next_url)
     gather.say(
         "Thank you. Is this urgent? Please say yes or no.",
@@ -223,6 +262,7 @@ def get_urgency():
     response = VoiceResponse()
 
     answer = yes_no_answer(request.values.get("SpeechResult"))
+    name = request.args.get("name", "")
     service = request.args.get("service", "")
     intent = request.args.get("intent", "")
     caller = request.args.get("caller", "Unknown")
@@ -232,7 +272,7 @@ def get_urgency():
     elif answer == "no":
         urgency = "Not Urgent"
     else:
-        retry_url = build_url("/get_urgency", service=service, intent=intent, caller=caller)
+        retry_url = build_url("/get_urgency", name=name, service=service, intent=intent, caller=caller)
         gather = gather_speech(retry_url)
         gather.say(
             "Please say yes or no. Is this urgent?",
@@ -245,6 +285,7 @@ def get_urgency():
 
     next_url = build_url(
         "/get_details",
+        name=name,
         service=service,
         intent=intent,
         urgency=urgency,
@@ -269,11 +310,13 @@ def get_details():
     print("SpeechResult:", request.values.get("SpeechResult"))
 
     details = clean_text(request.values.get("SpeechResult"))
+    name = request.args.get("name", "")
     service = request.args.get("service", "")
     intent = request.args.get("intent", "")
     urgency = request.args.get("urgency", "")
     caller = request.args.get("caller", "Unknown")
 
+    print("name:", name)
     print("service:", service)
     print("intent:", intent)
     print("urgency:", urgency)
@@ -282,10 +325,10 @@ def get_details():
     if not details:
         details = "No extra details provided"
 
-    append_to_csv(caller, service, intent, urgency, details)
+    append_to_csv(name, caller, service, intent, urgency, details)
 
     response.say(
-        f"Thank you. I have your request for {service}. Someone will follow up with you soon. Goodbye.",
+        f"Thank you {name}. I have your request for {service}. Someone will follow up with you soon. Goodbye.",
         voice=VOICE,
         language=LANGUAGE
     )
@@ -293,7 +336,21 @@ def get_details():
     return str(response)
 
 
+@app.route("/check-csv", methods=["GET"])
+def check_csv():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return f"<pre>{f.read()}</pre>"
+    return "CSV file not found.", 404
+
+
+@app.route("/download-csv", methods=["GET"])
+def download_csv():
+    if os.path.exists(DATA_FILE):
+        return send_file(DATA_FILE, as_attachment=True)
+    return "CSV file not found.", 404
+
+
 if __name__ == "__main__":
-    ensure_csv_exists()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
