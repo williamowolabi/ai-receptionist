@@ -7,22 +7,16 @@ from urllib.parse import urlencode
 
 app = Flask(__name__)
 
-# Render persistent disk path; local fallback for your Mac
 DATA_FILE = "/var/data/calls.csv" if os.path.exists("/var/data") else "calls.csv"
-
-# Better-sounding Twilio voice options are supported on <Say>.
-# You can swap this later if you want a different sound.
 VOICE = "Polly.Joanna"
 LANGUAGE = "en-US"
 
 
 def say_text(response, text):
-    """Speak text with a chosen voice."""
     response.say(text, voice=VOICE, language=LANGUAGE)
 
 
 def gather_speech(action_url):
-    """Create a speech gather with solid defaults."""
     return Gather(
         input="speech",
         action=action_url,
@@ -33,7 +27,6 @@ def gather_speech(action_url):
 
 
 def build_url(path, **params):
-    """Safely build URLs with encoded query parameters."""
     if not params:
         return path
     return f"{path}?{urlencode(params)}"
@@ -46,7 +39,6 @@ def clean_text(value):
 
 
 def yes_no_answer(text):
-    """Normalize common yes/no variations."""
     t = clean_text(text).lower()
     if any(word in t for word in ["yes", "yeah", "yep", "correct", "right", "affirmative"]):
         return "yes"
@@ -74,6 +66,14 @@ def ensure_csv_exists():
 
 
 def append_to_csv(caller, service, intent, urgency, details):
+    print("append_to_csv called")
+    print("Saving to:", DATA_FILE)
+    print("caller =", caller)
+    print("service =", service)
+    print("intent =", intent)
+    print("urgency =", urgency)
+    print("details =", details)
+
     with open(DATA_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -85,10 +85,12 @@ def append_to_csv(caller, service, intent, urgency, details):
             details
         ])
 
+    print("Row written successfully")
 
-@app.route("/", methods=["GET"])
+
+@app.route("/")
 def home():
-    return "AI Receptionist is running."
+    return "AI Receptionist is running." 
 
 
 @app.route("/voice", methods=["GET", "POST"])
@@ -263,21 +265,29 @@ def get_urgency():
 def get_details():
     response = VoiceResponse()
 
+    print("Entered /get_details")
+    print("SpeechResult:", request.values.get("SpeechResult"))
+
     details = clean_text(request.values.get("SpeechResult"))
     service = request.args.get("service", "")
     intent = request.args.get("intent", "")
     urgency = request.args.get("urgency", "")
     caller = request.args.get("caller", "Unknown")
 
+    print("service:", service)
+    print("intent:", intent)
+    print("urgency:", urgency)
+    print("caller:", caller)
+
     if not details:
         details = "No extra details provided"
 
     append_to_csv(caller, service, intent, urgency, details)
 
-    say_text(
-        response,
-        f"Thank you. I have your request for {service}. "
-        "We’ve saved your information and someone will follow up with you soon. Goodbye."
+    response.say(
+        f"Thank you. I have your request for {service}. Someone will follow up with you soon. Goodbye.",
+        voice=VOICE,
+        language=LANGUAGE
     )
     response.hangup()
     return str(response)
