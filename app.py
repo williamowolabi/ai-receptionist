@@ -1,22 +1,61 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[1]:from flask import Flask, request, send_file
 from flask import Flask, request
 from twilio.twiml.voice_response import VoiceResponse, Gather
 import os
 import csv
 from datetime import datetime
+from urllib.parse import urlencode
 
 app = Flask(__name__)
 
-# On Render, /var/data exists if you mounted a persistent disk there.
-# Locally, it will save calls.csv in your project folder.
+# Render persistent disk path; local fallback for your Mac
 DATA_FILE = "/var/data/calls.csv" if os.path.exists("/var/data") else "calls.csv"
+
+# Better-sounding Twilio voice options are supported on <Say>.
+# You can swap this later if you want a different sound.
+VOICE = "Polly.Joanna"
+LANGUAGE = "en-US"
+
+
+def say_text(response, text):
+    """Speak text with a chosen voice."""
+    response.say(text, voice=VOICE, language=LANGUAGE)
+
+
+def gather_speech(action_url):
+    """Create a speech gather with solid defaults."""
+    return Gather(
+        input="speech",
+        action=action_url,
+        method="POST",
+        speech_timeout="auto",
+        language=LANGUAGE
+    )
+
+
+def build_url(path, **params):
+    """Safely build URLs with encoded query parameters."""
+    if not params:
+        return path
+    return f"{path}?{urlencode(params)}"
+
+
+def clean_text(value):
+    if not value:
+        return ""
+    return value.strip()
+
+
+def yes_no_answer(text):
+    """Normalize common yes/no variations."""
+    t = clean_text(text).lower()
+    if any(word in t for word in ["yes", "yeah", "yep", "correct", "right", "affirmative"]):
+        return "yes"
+    if any(word in t for word in ["no", "nope", "nah", "incorrect", "wrong"]):
+        return "no"
+    return ""
 
 
 def ensure_csv_exists():
-    """Create the CSV file with headers if it does not already exist."""
     folder = os.path.dirname(DATA_FILE)
     if folder:
         os.makedirs(folder, exist_ok=True)
@@ -35,7 +74,6 @@ def ensure_csv_exists():
 
 
 def append_to_csv(caller, service, intent, urgency, details):
-    """Append one completed call row to the CSV."""
     with open(DATA_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -48,13 +86,6 @@ def append_to_csv(caller, service, intent, urgency, details):
         ])
 
 
-def clean_text(value):
-    """Safely clean speech input."""
-    if not value:
-        return ""
-    return value.strip()
-
-
 @app.route("/", methods=["GET"])
 def home():
     return "AI Receptionist is running."
@@ -62,18 +93,15 @@ def home():
 
 @app.route("/voice", methods=["GET", "POST"])
 def voice():
-    """Initial incoming call route."""
     response = VoiceResponse()
 
-    gather = Gather(
-        input="speech",
-        action="/get_service",
-        method="POST",
-        speech_timeout="auto"
-    )
+    gather = gather_speech("/get_service")
     gather.say(
-        "Thank you for calling. Please tell me what kind of service you need today, "
-        "such as plumbing, HVAC, electrical, roofing, or something else."
+        "Thank you for calling. You’ve reached the service desk. "
+        "Please tell me what type of service you need today, "
+        "like plumbing, HVAC, electrical, roofing, or something else.",
+        voice=VOICE,
+        language=LANGUAGE
     )
     response.append(gather)
 
@@ -83,85 +111,81 @@ def voice():
 
 @app.route("/get_service", methods=["POST"])
 def get_service():
-    """Capture the requested service and ask for yes/no confirmation."""
     response = VoiceResponse()
 
     service = clean_text(request.values.get("SpeechResult"))
     caller = request.values.get("From", "Unknown")
 
     if not service:
-        gather = Gather(
-            input="speech",
-            action="/get_service",
-            method="POST",
-            speech_timeout="auto"
+        gather = gather_speech("/get_service")
+        gather.say(
+            "I didn’t catch that. Please tell me the type of service you need.",
+            voice=VOICE,
+            language=LANGUAGE
         )
-        gather.say("I did not catch that. Please say the type of service you need.")
         response.append(gather)
         response.redirect("/voice")
         return str(response)
 
-    gather = Gather(
-        input="speech",
-        action=f"/confirm_service?service={service}&caller={caller}",
-        method="POST",
-        speech_timeout="auto"
+    confirm_url = build_url("/confirm_service", service=service, caller=caller)
+
+    gather = gather_speech(confirm_url)
+    gather.say(
+        f"Just to make sure I heard you right, you need {service}. Please say yes or no.",
+        voice=VOICE,
+        language=LANGUAGE
     )
-    gather.say(f"Just to confirm, you need {service}. Is that correct? Please say yes or no.")
     response.append(gather)
 
-    response.redirect(f"/get_service")
+    response.redirect(confirm_url)
     return str(response)
 
 
 @app.route("/confirm_service", methods=["POST"])
 def confirm_service():
-    """Handle yes/no confirmation for service."""
     response = VoiceResponse()
 
-    answer = clean_text(request.values.get("SpeechResult")).lower()
+    answer = yes_no_answer(request.values.get("SpeechResult"))
     service = request.args.get("service", "")
     caller = request.args.get("caller", "Unknown")
 
-    if "yes" in answer:
-        gather = Gather(
-            input="speech",
-            action=f"/get_intent?service={service}&caller={caller}",
-            method="POST",
-            speech_timeout="auto"
+    if answer == "yes":
+        next_url = build_url("/get_intent", service=service, caller=caller)
+        gather = gather_speech(next_url)
+        gather.say(
+            "Great. Please briefly tell me what is going on and what you need help with.",
+            voice=VOICE,
+            language=LANGUAGE
         )
-        gather.say("Great. Please briefly tell me what you need help with.")
         response.append(gather)
-        response.redirect(f"/confirm_service?service={service}&caller={caller}")
+        response.redirect(next_url)
         return str(response)
 
-    if "no" in answer:
-        gather = Gather(
-            input="speech",
-            action="/get_service",
-            method="POST",
-            speech_timeout="auto"
+    if answer == "no":
+        gather = gather_speech("/get_service")
+        gather.say(
+            "Okay, let’s try that again. Please tell me the type of service you need.",
+            voice=VOICE,
+            language=LANGUAGE
         )
-        gather.say("No problem. Please say the type of service you need again.")
         response.append(gather)
         response.redirect("/voice")
         return str(response)
 
-    gather = Gather(
-        input="speech",
-        action=f"/confirm_service?service={service}&caller={caller}",
-        method="POST",
-        speech_timeout="auto"
+    retry_url = build_url("/confirm_service", service=service, caller=caller)
+    gather = gather_speech(retry_url)
+    gather.say(
+        "Please say yes or no. Do you need that service?",
+        voice=VOICE,
+        language=LANGUAGE
     )
-    gather.say("Please say yes or no. Is that service correct?")
     response.append(gather)
-    response.redirect(f"/confirm_service?service={service}&caller={caller}")
+    response.redirect(retry_url)
     return str(response)
 
 
 @app.route("/get_intent", methods=["POST"])
 def get_intent():
-    """Capture what the caller needs help with."""
     response = VoiceResponse()
 
     intent = clean_text(request.values.get("SpeechResult"))
@@ -169,72 +193,74 @@ def get_intent():
     caller = request.args.get("caller", "Unknown")
 
     if not intent:
-        gather = Gather(
-            input="speech",
-            action=f"/get_intent?service={service}&caller={caller}",
-            method="POST",
-            speech_timeout="auto"
+        retry_url = build_url("/get_intent", service=service, caller=caller)
+        gather = gather_speech(retry_url)
+        gather.say(
+            "I didn’t catch that. Please briefly tell me what you need help with.",
+            voice=VOICE,
+            language=LANGUAGE
         )
-        gather.say("I did not catch that. Please briefly tell me what you need help with.")
         response.append(gather)
-        response.redirect(f"/get_intent?service={service}&caller={caller}")
+        response.redirect(retry_url)
         return str(response)
 
-    gather = Gather(
-        input="speech",
-        action=f"/get_urgency?service={service}&intent={intent}&caller={caller}",
-        method="POST",
-        speech_timeout="auto"
+    next_url = build_url("/get_urgency", service=service, intent=intent, caller=caller)
+    gather = gather_speech(next_url)
+    gather.say(
+        "Thank you. Is this urgent? Please say yes or no.",
+        voice=VOICE,
+        language=LANGUAGE
     )
-    gather.say("Is this urgent? Please say yes or no.")
     response.append(gather)
-
-    response.redirect(f"/get_intent?service={service}&caller={caller}")
+    response.redirect(next_url)
     return str(response)
 
 
 @app.route("/get_urgency", methods=["POST"])
 def get_urgency():
-    """Capture urgency as yes/no."""
     response = VoiceResponse()
 
-    answer = clean_text(request.values.get("SpeechResult")).lower()
+    answer = yes_no_answer(request.values.get("SpeechResult"))
     service = request.args.get("service", "")
     intent = request.args.get("intent", "")
     caller = request.args.get("caller", "Unknown")
 
-    if "yes" in answer:
+    if answer == "yes":
         urgency = "Urgent"
-    elif "no" in answer:
+    elif answer == "no":
         urgency = "Not Urgent"
     else:
-        gather = Gather(
-            input="speech",
-            action=f"/get_urgency?service={service}&intent={intent}&caller={caller}",
-            method="POST",
-            speech_timeout="auto"
+        retry_url = build_url("/get_urgency", service=service, intent=intent, caller=caller)
+        gather = gather_speech(retry_url)
+        gather.say(
+            "Please say yes or no. Is this urgent?",
+            voice=VOICE,
+            language=LANGUAGE
         )
-        gather.say("Please say yes or no. Is this urgent?")
         response.append(gather)
-        response.redirect(f"/get_urgency?service={service}&intent={intent}&caller={caller}")
+        response.redirect(retry_url)
         return str(response)
 
-    gather = Gather(
-        input="speech",
-        action=f"/get_details?service={service}&intent={intent}&urgency={urgency}&caller={caller}",
-        method="POST",
-        speech_timeout="auto"
+    next_url = build_url(
+        "/get_details",
+        service=service,
+        intent=intent,
+        urgency=urgency,
+        caller=caller
     )
-    gather.say("Please share any extra details you want us to know.")
+    gather = gather_speech(next_url)
+    gather.say(
+        "Got it. Please share any extra details you want us to know.",
+        voice=VOICE,
+        language=LANGUAGE
+    )
     response.append(gather)
-
-    response.redirect(f"/get_urgency?service={service}&intent={intent}&caller={caller}")
+    response.redirect(next_url)
     return str(response)
 
 
 @app.route("/get_details", methods=["POST"])
 def get_details():
-    """Capture extra details and save everything to CSV."""
     response = VoiceResponse()
 
     details = clean_text(request.values.get("SpeechResult"))
@@ -248,9 +274,10 @@ def get_details():
 
     append_to_csv(caller, service, intent, urgency, details)
 
-    response.say(
-        f"Thank you. We have your request for {service}. "
-        "Someone will follow up with you soon. Goodbye."
+    say_text(
+        response,
+        f"Thank you. I have your request for {service}. "
+        "We’ve saved your information and someone will follow up with you soon. Goodbye."
     )
     response.hangup()
     return str(response)
