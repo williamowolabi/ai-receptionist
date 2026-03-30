@@ -125,6 +125,51 @@ def clean_text(value):
     return value
 
 
+def extract_name(value):
+    """
+    Strip common name prefixes so we get just the name.
+    e.g. 'my name is John Smith' -> 'John Smith'
+    """
+    if not value:
+        return ""
+    text = value.strip()
+
+    # Common phrases people say before their name
+    prefixes = [
+        "my name is ",
+        "my name's ",
+        "this is ",
+        "it's ",
+        "its ",
+        "i'm ",
+        "im ",
+        "i am ",
+        "the name is ",
+        "name is ",
+        "call me ",
+        "hi my name is ",
+        "hello my name is ",
+        "hey my name is ",
+        "hi i'm ",
+        "hello i'm ",
+        "hi this is ",
+        "hello this is ",
+    ]
+
+    lower = text.lower()
+    for prefix in prefixes:
+        if lower.startswith(prefix):
+            text = text[len(prefix):]
+            break
+
+    # Ignore very short results — probably just noise
+    if len(text.strip()) < 2:
+        return ""
+
+    # Capitalize properly e.g. "john smith" -> "John Smith"
+    return text.strip().title()
+
+
 def yes_no_answer(text):
     t = clean_text(text).lower()
     if any(w in t for w in ["yes", "yeah", "yep", "correct", "right", "affirmative", "sure", "absolutely"]):
@@ -198,7 +243,8 @@ def voice():
 @app.route("/get_name", methods=["POST"])
 def get_name():
     response = VoiceResponse()
-    name = clean_text(request.values.get("SpeechResult"))
+    # Use extract_name instead of clean_text to strip "my name is" etc.
+    name = extract_name(request.values.get("SpeechResult"))
     caller = request.values.get("From", "Unknown")
 
     if not name:
@@ -250,7 +296,7 @@ def confirm_service():
     if answer == "yes":
         next_url = build_url("/get_intent", name=name, service=service, caller=caller)
         gather = gather_speech(next_url, hints=GENERAL_HINTS)
-        say(gather, "Great. Can you briefly describe what's going on and what you need help with?")
+        say(gather, "Great. Can you briefly describe what is going on and what you need help with?")
         response.append(gather)
         response.redirect(next_url)
         return str(response)
