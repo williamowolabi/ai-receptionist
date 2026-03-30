@@ -1,5 +1,6 @@
 from flask import Flask, request, send_file
 from twilio.twiml.voice_response import VoiceResponse, Gather
+from twilio.rest import Client
 import os
 import csv
 from datetime import datetime
@@ -10,6 +11,49 @@ app = Flask(__name__)
 DATA_FILE = "/var/data/calls.csv" if os.path.exists("/var/data") else "calls.csv"
 VOICE = "Polly.Joanna"
 LANGUAGE = "en-US"
+
+# --- TWILIO CREDENTIALS ---
+# Add these to your environment variables
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER")  # Your Twilio number e.g. +12025551234
+
+# --- YOUR CALENDLY LINK ---
+# Replace this with your actual Calendly booking link
+CALENDLY_LINK = os.environ.get("CALENDLY_LINK", "https://calendly.com/your-link-here")
+
+
+def send_booking_sms(to_number, name, service):
+    """Send a Calendly booking link via SMS after the call."""
+    try:
+        if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_PHONE_NUMBER:
+            print("Twilio credentials not set — skipping SMS")
+            return
+
+        # Clean up the phone number
+        if to_number == "Unknown" or not to_number:
+            print("No valid phone number — skipping SMS")
+            return
+
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+        message_body = (
+            f"Hi {name}, thanks for calling! "
+            f"To book your {service} appointment, use the link below:\n\n"
+            f"{CALENDLY_LINK}\n\n"
+            f"We look forward to helping you!"
+        )
+
+        client.messages.create(
+            body=message_body,
+            from_=TWILIO_PHONE_NUMBER,
+            to=to_number
+        )
+
+        print(f"SMS sent to {to_number}")
+
+    except Exception as e:
+        print(f"Failed to send SMS: {e}")
 
 
 def say_text(response, text):
@@ -325,10 +369,17 @@ def get_details():
     if not details:
         details = "No extra details provided"
 
+    # Save to CSV
     append_to_csv(name, caller, service, intent, urgency, details)
 
+    # Send Calendly booking link via SMS
+    send_booking_sms(caller, name, service)
+
+    # Tell caller a text is on the way
     response.say(
-        f"Thank you {name}. I have your request for {service}. Someone will follow up with you soon. Goodbye.",
+        f"Thank you {name}. I have your request for {service}. "
+        f"I am sending a text message to your phone right now with a link to book your appointment. "
+        f"Please check your messages. We look forward to helping you. Goodbye.",
         voice=VOICE,
         language=LANGUAGE
     )
@@ -349,6 +400,7 @@ def download_csv():
     if os.path.exists(DATA_FILE):
         return send_file(DATA_FILE, as_attachment=True)
     return "CSV file not found.", 404
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
