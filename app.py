@@ -1,63 +1,91 @@
-from flask import Flask, request, send_file
+from flask import Flask, request, send_file, Response
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.rest import Client
+from openai import OpenAI
 import os
 import csv
+import hashlib
 from datetime import datetime
 from urllib.parse import urlencode
 
 app = Flask(__name__)
 
 DATA_FILE = "/var/data/calls.csv" if os.path.exists("/var/data") else "calls.csv"
-VOICE = "Polly.Joanna"
 LANGUAGE = "en-US"
 
+# --- OPENAI ---
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# Voice options: alloy, echo, fable, onyx, nova, shimmer
+# nova = warm friendly female | alloy = neutral professional
+OPENAI_VOICE = "nova"
+
 # --- TWILIO CREDENTIALS ---
-# Add these to your environment variables
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER")  # Your Twilio number e.g. +12025551234
+TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER")
 
 # --- YOUR CALENDLY LINK ---
-# Replace this with your actual Calendly booking link
 CALENDLY_LINK = os.environ.get("CALENDLY_LINK", "https://calendly.com/your-link-here")
 
+# --- YOUR PUBLIC APP URL ---
+# Set this in Render: e.g. https://your-app.onrender.com
+APP_URL = os.environ.get("APP_URL", "").rstrip("/")
 
-def send_booking_sms(to_number, name, service):
-    """Send a Calendly booking link via SMS after the call."""
+# In-memory cache: hash -> text and hash -> audio bytes
+text_cache = {}
+audio_cache = {}
+
+
+def generate_speech(text):
+    """Generate speech using OpenAI TTS and return mp3 bytes."""
+    if not openai_client:
+        return None
     try:
-        if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_PHONE_NUMBER:
-            print("Twilio credentials not set — skipping SMS")
-            return
-
-        # Clean up the phone number
-        if to_number == "Unknown" or not to_number:
-            print("No valid phone number — skipping SMS")
-            return
-
-        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-        message_body = (
-            f"Hi {name}, thanks for calling! "
-            f"To book your {service} appointment, use the link below:\n\n"
-            f"{CALENDLY_LINK}\n\n"
-            f"We look forward to helping you!"
+        resp = openai_client.audio.speech.create(
+            model="tts-1",
+            voice=OPENAI_VOICE,
+            input=text,
+            response_format="mp3"
         )
-
-        client.messages.create(
-            body=message_body,
-            from_=TWILIO_PHONE_NUMBER,
-            to=to_number
-        )
-
-        print(f"SMS sent to {to_number}")
-
+        return resp.content
     except Exception as e:
-        print(f"Failed to send SMS: {e}")
+        print(f"OpenAI TTS error: {e}")
+        return None
 
 
-def say_text(response, text):
-    response.say(text, voice=VOICE, language=LANGUAGE)
+def say(response, text):
+    """
+    Play OpenAI TTS audio if configured, otherwise fall back to Polly.
+    Twilio requires a publicly accessible URL to stream audio.
+    """
+    if openai_client and APP_URL:
+        key = hashlib.md5(text.encode()).hexdigest()
+        text_cache[key] = text
+        audio_url = f"{APP_URL}/audio/{key}"
+        response.play(audio_url)
+    else:
+        response.say(text, voice="Polly.Joanna", language=LANGUAGE)
+
+
+@app.route("/audio/<key>", methods=["GET"])
+def serve_audio(key):
+    """Generate and serve OpenAI TTS audio on demand."""
+    text = text_cache.get(key)
+    if not text:
+        return "Audio not found", 404
+
+    # Serve from cache if already generated
+    if key in audio_cache:
+        return Response(audio_cache[key], mimetype="audio/mpeg")
+
+    audio_data = generate_speech(text)
+    if not audio_data:
+        return "Audio generation failed", 500
+
+    audio_cache[key] = audio_data
+    return Response(audio_data, mimetype="audio/mpeg")
 
 
 def gather_speech(action_url):
@@ -84,55 +112,51 @@ def clean_text(value):
 
 def yes_no_answer(text):
     t = clean_text(text).lower()
-    if any(word in t for word in ["yes", "yeah", "yep", "correct", "right", "affirmative"]):
+    if any(w in t for w in ["yes", "yeah", "yep", "correct", "right", "affirmative"]):
         return "yes"
-    if any(word in t for word in ["no", "nope", "nah", "incorrect", "wrong"]):
+    if any(w in t for w in ["no", "nope", "nah", "incorrect", "wrong"]):
         return "no"
     return ""
+
+
+def send_booking_sms(to_number, name, service):
+    """Send Calendly booking link via SMS after the call ends."""
+    try:
+        if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER]):
+            print("Twilio credentials missing — skipping SMS")
+            return
+        if not to_number or to_number == "Unknown":
+            print("No valid phone number — skipping SMS")
+            return
+
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        body = (
+            f"Hi {name}, thanks for calling!\n\n"
+            f"To book your {service} appointment click below:\n"
+            f"{CALENDLY_LINK}\n\n"
+            f"We look forward to helping you!"
+        )
+        client.messages.create(body=body, from_=TWILIO_PHONE_NUMBER, to=to_number)
+        print(f"SMS sent to {to_number}")
+    except Exception as e:
+        print(f"SMS failed: {e}")
 
 
 def ensure_csv_exists():
     folder = os.path.dirname(DATA_FILE)
     if folder:
         os.makedirs(folder, exist_ok=True)
-
     if not os.path.exists(DATA_FILE):
         with open(DATA_FILE, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                "timestamp",
-                "name",
-                "caller_phone",
-                "service",
-                "intent",
-                "urgency",
-                "details"
-            ])
+            writer.writerow(["timestamp", "name", "caller_phone", "service", "intent", "urgency", "details"])
 
 
 def append_to_csv(name, caller, service, intent, urgency, details):
-    print("append_to_csv called")
-    print("Saving to:", DATA_FILE)
-    print("name =", name)
-    print("caller =", caller)
-    print("service =", service)
-    print("intent =", intent)
-    print("urgency =", urgency)
-    print("details =", details)
-
     with open(DATA_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            name,
-            caller,
-            service,
-            intent,
-            urgency,
-            details
-        ])
-
-    print("Row written successfully")
+        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name, caller, service, intent, urgency, details])
+    print("Call saved to CSV")
 
 
 ensure_csv_exists()
@@ -146,15 +170,9 @@ def home():
 @app.route("/voice", methods=["GET", "POST"])
 def voice():
     response = VoiceResponse()
-
     gather = gather_speech("/get_name")
-    gather.say(
-        "Thank you for calling. You've reached the service desk. May I have your full name please?",
-        voice=VOICE,
-        language=LANGUAGE
-    )
+    say(gather, "Thank you for calling. You've reached the service desk. May I have your full name please?")
     response.append(gather)
-
     response.redirect("/voice")
     return str(response)
 
@@ -162,30 +180,20 @@ def voice():
 @app.route("/get_name", methods=["POST"])
 def get_name():
     response = VoiceResponse()
-
     name = clean_text(request.values.get("SpeechResult"))
     caller = request.values.get("From", "Unknown")
 
     if not name:
         gather = gather_speech("/get_name")
-        gather.say(
-            "I didn't catch your name. Please say your full name.",
-            voice=VOICE,
-            language=LANGUAGE
-        )
+        say(gather, "I didn't catch your name. Please say your full name.")
         response.append(gather)
         response.redirect("/voice")
         return str(response)
 
     next_url = build_url("/get_service", name=name, caller=caller)
     gather = gather_speech(next_url)
-    gather.say(
-        f"Thank you {name}. Please tell me what type of service you need today, like plumbing, HVAC, electrical, roofing, or something else.",
-        voice=VOICE,
-        language=LANGUAGE
-    )
+    say(gather, f"Thank you {name}. Please tell me what type of service you need today, like plumbing, HVAC, electrical, roofing, or something else.")
     response.append(gather)
-
     response.redirect(next_url)
     return str(response)
 
@@ -193,7 +201,6 @@ def get_name():
 @app.route("/get_service", methods=["POST"])
 def get_service():
     response = VoiceResponse()
-
     service = clean_text(request.values.get("SpeechResult"))
     name = request.args.get("name", "")
     caller = request.args.get("caller", "Unknown")
@@ -201,24 +208,15 @@ def get_service():
     if not service:
         retry_url = build_url("/get_service", name=name, caller=caller)
         gather = gather_speech(retry_url)
-        gather.say(
-            "I didn't catch that. Please tell me the type of service you need.",
-            voice=VOICE,
-            language=LANGUAGE
-        )
+        say(gather, "I didn't catch that. Please tell me the type of service you need.")
         response.append(gather)
         response.redirect(retry_url)
         return str(response)
 
     confirm_url = build_url("/confirm_service", name=name, service=service, caller=caller)
     gather = gather_speech(confirm_url)
-    gather.say(
-        f"Just to make sure I heard you right, you need {service}. Please say yes or no.",
-        voice=VOICE,
-        language=LANGUAGE
-    )
+    say(gather, f"Just to make sure I heard you right, you need {service}. Please say yes or no.")
     response.append(gather)
-
     response.redirect(confirm_url)
     return str(response)
 
@@ -226,7 +224,6 @@ def get_service():
 @app.route("/confirm_service", methods=["POST"])
 def confirm_service():
     response = VoiceResponse()
-
     answer = yes_no_answer(request.values.get("SpeechResult"))
     name = request.args.get("name", "")
     service = request.args.get("service", "")
@@ -235,11 +232,7 @@ def confirm_service():
     if answer == "yes":
         next_url = build_url("/get_intent", name=name, service=service, caller=caller)
         gather = gather_speech(next_url)
-        gather.say(
-            "Great. Please briefly tell me what is going on and what you need help with.",
-            voice=VOICE,
-            language=LANGUAGE
-        )
+        say(gather, "Great. Please briefly tell me what is going on and what you need help with.")
         response.append(gather)
         response.redirect(next_url)
         return str(response)
@@ -247,22 +240,14 @@ def confirm_service():
     if answer == "no":
         next_url = build_url("/get_service", name=name, caller=caller)
         gather = gather_speech(next_url)
-        gather.say(
-            "Okay, let's try that again. Please tell me the type of service you need.",
-            voice=VOICE,
-            language=LANGUAGE
-        )
+        say(gather, "Okay, let's try that again. Please tell me the type of service you need.")
         response.append(gather)
         response.redirect(next_url)
         return str(response)
 
     retry_url = build_url("/confirm_service", name=name, service=service, caller=caller)
     gather = gather_speech(retry_url)
-    gather.say(
-        "Please say yes or no. Do you need that service?",
-        voice=VOICE,
-        language=LANGUAGE
-    )
+    say(gather, "Please say yes or no. Do you need that service?")
     response.append(gather)
     response.redirect(retry_url)
     return str(response)
@@ -271,7 +256,6 @@ def confirm_service():
 @app.route("/get_intent", methods=["POST"])
 def get_intent():
     response = VoiceResponse()
-
     intent = clean_text(request.values.get("SpeechResult"))
     name = request.args.get("name", "")
     service = request.args.get("service", "")
@@ -280,22 +264,14 @@ def get_intent():
     if not intent:
         retry_url = build_url("/get_intent", name=name, service=service, caller=caller)
         gather = gather_speech(retry_url)
-        gather.say(
-            "I didn't catch that. Please briefly tell me what you need help with.",
-            voice=VOICE,
-            language=LANGUAGE
-        )
+        say(gather, "I didn't catch that. Please briefly tell me what you need help with.")
         response.append(gather)
         response.redirect(retry_url)
         return str(response)
 
     next_url = build_url("/get_urgency", name=name, service=service, intent=intent, caller=caller)
     gather = gather_speech(next_url)
-    gather.say(
-        "Thank you. Is this urgent? Please say yes or no.",
-        voice=VOICE,
-        language=LANGUAGE
-    )
+    say(gather, "Thank you. Is this urgent? Please say yes or no.")
     response.append(gather)
     response.redirect(next_url)
     return str(response)
@@ -304,7 +280,6 @@ def get_intent():
 @app.route("/get_urgency", methods=["POST"])
 def get_urgency():
     response = VoiceResponse()
-
     answer = yes_no_answer(request.values.get("SpeechResult"))
     name = request.args.get("name", "")
     service = request.args.get("service", "")
@@ -318,29 +293,14 @@ def get_urgency():
     else:
         retry_url = build_url("/get_urgency", name=name, service=service, intent=intent, caller=caller)
         gather = gather_speech(retry_url)
-        gather.say(
-            "Please say yes or no. Is this urgent?",
-            voice=VOICE,
-            language=LANGUAGE
-        )
+        say(gather, "Please say yes or no. Is this urgent?")
         response.append(gather)
         response.redirect(retry_url)
         return str(response)
 
-    next_url = build_url(
-        "/get_details",
-        name=name,
-        service=service,
-        intent=intent,
-        urgency=urgency,
-        caller=caller
-    )
+    next_url = build_url("/get_details", name=name, service=service, intent=intent, urgency=urgency, caller=caller)
     gather = gather_speech(next_url)
-    gather.say(
-        "Got it. Please share any extra details you want us to know.",
-        voice=VOICE,
-        language=LANGUAGE
-    )
+    say(gather, "Got it. Please share any extra details you want us to know.")
     response.append(gather)
     response.redirect(next_url)
     return str(response)
@@ -349,10 +309,6 @@ def get_urgency():
 @app.route("/get_details", methods=["POST"])
 def get_details():
     response = VoiceResponse()
-
-    print("Entered /get_details")
-    print("SpeechResult:", request.values.get("SpeechResult"))
-
     details = clean_text(request.values.get("SpeechResult"))
     name = request.args.get("name", "")
     service = request.args.get("service", "")
@@ -360,29 +316,17 @@ def get_details():
     urgency = request.args.get("urgency", "")
     caller = request.args.get("caller", "Unknown")
 
-    print("name:", name)
-    print("service:", service)
-    print("intent:", intent)
-    print("urgency:", urgency)
-    print("caller:", caller)
-
     if not details:
         details = "No extra details provided"
 
-    # Save to CSV
     append_to_csv(name, caller, service, intent, urgency, details)
-
-    # Send Calendly booking link via SMS
     send_booking_sms(caller, name, service)
 
-    # Tell caller a text is on the way
-    response.say(
+    say(response, (
         f"Thank you {name}. I have your request for {service}. "
         f"I am sending a text message to your phone right now with a link to book your appointment. "
-        f"Please check your messages. We look forward to helping you. Goodbye.",
-        voice=VOICE,
-        language=LANGUAGE
-    )
+        f"Please check your messages. We look forward to helping you. Goodbye."
+    ))
     response.hangup()
     return str(response)
 
