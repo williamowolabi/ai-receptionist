@@ -58,7 +58,7 @@ def ensure_csv_exists():
             writer.writerow([
                 "timestamp",
                 "name",
-                "caller",
+                "caller_phone",
                 "service",
                 "intent",
                 "urgency",
@@ -105,7 +105,7 @@ def voice():
 
     gather = gather_speech("/get_name")
     gather.say(
-        "Thank you for calling. You’ve reached the service desk. May I have your full name please?",
+        "Thank you for calling. You've reached the service desk. May I have your full name please?",
         voice=VOICE,
         language=LANGUAGE
     )
@@ -125,7 +125,7 @@ def get_name():
     if not name:
         gather = gather_speech("/get_name")
         gather.say(
-            "I didn’t catch your name. Please say your full name.",
+            "I didn't catch your name. Please say your full name.",
             voice=VOICE,
             language=LANGUAGE
         )
@@ -158,7 +158,7 @@ def get_service():
         retry_url = build_url("/get_service", name=name, caller=caller)
         gather = gather_speech(retry_url)
         gather.say(
-            "I didn’t catch that. Please tell me the type of service you need.",
+            "I didn't catch that. Please tell me the type of service you need.",
             voice=VOICE,
             language=LANGUAGE
         )
@@ -204,7 +204,7 @@ def confirm_service():
         next_url = build_url("/get_service", name=name, caller=caller)
         gather = gather_speech(next_url)
         gather.say(
-            "Okay, let’s try that again. Please tell me the type of service you need.",
+            "Okay, let's try that again. Please tell me the type of service you need.",
             voice=VOICE,
             language=LANGUAGE
         )
@@ -237,7 +237,7 @@ def get_intent():
         retry_url = build_url("/get_intent", name=name, service=service, caller=caller)
         gather = gather_speech(retry_url)
         gather.say(
-            "I didn’t catch that. Please briefly tell me what you need help with.",
+            "I didn't catch that. Please briefly tell me what you need help with.",
             voice=VOICE,
             language=LANGUAGE
         )
