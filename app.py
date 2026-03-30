@@ -350,13 +350,6 @@ def download_csv():
         return send_file(DATA_FILE, as_attachment=True)
     return "CSV file not found.", 404
 
-@app.route("/reset-csv", methods=["GET"])
-def reset_csv():
-    if os.path.exists(DATA_FILE):
-        os.remove(DATA_FILE)
-    ensure_csv_exists()
-    return "CSV reset successfully."
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
