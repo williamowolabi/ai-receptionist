@@ -42,6 +42,11 @@ MAX_RETRIES = 3
 text_cache = {}
 audio_cache = {}
 
+# GPT response cache — avoids calling GPT for the same input twice
+# e.g. "plumbing" will always return "Plumbing" without hitting GPT again
+gpt_name_cache = {}
+gpt_service_cache = {}
+
 # Hints help Twilio recognize expected words and ignore noise
 GENERAL_HINTS = (
     "yes, no, yeah, nope, plumbing, HVAC, electrical, roofing, "
@@ -128,33 +133,49 @@ def transcribe_with_whisper(recording_url):
 def gpt_clean_name(raw_text):
     """
     Use GPT-4 to extract just the name from whatever the caller said.
-    Handles: "uh my name is John Smith", "it's John", "Johnny Smith here"
+    Caches results so the same input never calls GPT twice.
     Falls back to rule-based extraction if GPT fails.
     """
     if not openai_client or not raw_text:
         return extract_name(raw_text)
+
+    # Check cache first — instant response for repeated inputs
+    cache_key = raw_text.lower().strip()
+    if cache_key in gpt_name_cache:
+        print(f"Name cache hit: {cache_key}")
+        return gpt_name_cache[cache_key]
+
     try:
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
-            max_tokens=20,
+            max_tokens=10,
+            temperature=0,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "Extract only the person's name from the text. "
-                        "Return just the name, properly capitalized. "
-                        "If no name is found return empty string. "
-                        "Examples: 'my name is john smith' -> 'John Smith', "
-                        "'this is sarah' -> 'Sarah', 'uh hi its mike johnson' -> 'Mike Johnson'"
+                        "You extract names only. "
+                        "Return ONLY the person's name, properly capitalized. "
+                        "No punctuation. No extra words. No greetings. "
+                        "If no name found return exactly: NONE "
+                        "Examples: 'my name is john smith' -> John Smith "
+                        "'this is sarah' -> Sarah "
+                        "'uh hi its mike johnson' -> Mike Johnson"
                     )
                 },
                 {"role": "user", "content": raw_text}
             ]
         )
         name = resp.choices[0].message.content.strip()
-        if len(name) < 2 or len(name) > 50:
-            return extract_name(raw_text)
-        return name
+        if name == "NONE" or len(name) < 2 or len(name) > 50:
+            result = extract_name(raw_text)
+        else:
+            name = name.replace(".", "").replace(",", "").replace("!", "").strip()
+            result = name
+
+        # Cache the result
+        gpt_name_cache[cache_key] = result
+        return result
     except Exception as e:
         print(f"GPT name extraction error: {e}")
         return extract_name(raw_text)
@@ -163,36 +184,50 @@ def gpt_clean_name(raw_text):
 def gpt_clean_service(raw_text):
     """
     Use GPT-4 to identify the service type from natural speech.
-    Handles slang: "AC is busted" -> "HVAC", "pipes are leaking" -> "Plumbing"
+    Caches results so common services like "plumbing" never hit GPT twice.
     Falls back to raw text if GPT fails.
     """
     if not openai_client or not raw_text:
         return clean_text(raw_text)
+
+    # Check cache first — instant response for repeated inputs
+    cache_key = raw_text.lower().strip()
+    if cache_key in gpt_service_cache:
+        print(f"Service cache hit: {cache_key}")
+        return gpt_service_cache[cache_key]
+
     try:
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
-            max_tokens=15,
+            max_tokens=10,
+            temperature=0,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "Identify the home service type from the text. "
-                        "Return one of: Plumbing, HVAC, Electrical, Roofing, Landscaping, "
-                        "Painting, Flooring, General Handyman, or the closest match. "
-                        "Examples: 'my AC is broken' -> 'HVAC', "
-                        "'pipes are leaking' -> 'Plumbing', "
-                        "'lights wont turn on' -> 'Electrical', "
-                        "'my roof is leaking' -> 'Roofing'. "
-                        "Return just the service name, nothing else."
+                        "You identify home service types only. "
+                        "Return ONLY one of these exact words: "
+                        "Plumbing, HVAC, Electrical, Roofing, Landscaping, Painting, Flooring, Handyman "
+                        "No punctuation. No extra words. No greetings. No explanations. "
+                        "If unclear return: NONE "
+                        "Examples: my AC is broken -> HVAC "
+                        "pipes are leaking -> Plumbing "
+                        "lights wont turn on -> Electrical "
+                        "roof is leaking -> Roofing"
                     )
                 },
                 {"role": "user", "content": raw_text}
             ]
         )
         service = resp.choices[0].message.content.strip()
-        if len(service) < 2:
-            return clean_text(raw_text)
-        return service
+        if service == "NONE" or len(service) < 2:
+            result = clean_text(raw_text)
+        else:
+            result = service
+
+        # Cache the result
+        gpt_service_cache[cache_key] = result
+        return result
     except Exception as e:
         print(f"GPT service extraction error: {e}")
         return clean_text(raw_text)
@@ -217,13 +252,14 @@ def gpt_summarize_lead(name, service, intent, urgency, details, caller):
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             max_tokens=80,
+            temperature=0,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "Write a 1-2 sentence professional summary of this service call lead "
-                        "for a home service business owner. Be concise and factual. "
-                        "Include the most important details they need to know to follow up."
+                        "Write exactly 1-2 sentences summarizing this service call. "
+                        "Be factual and concise. No greetings. No sign-offs. "
+                        "No extra commentary. Just the summary."
                     )
                 },
                 {"role": "user", "content": prompt}
