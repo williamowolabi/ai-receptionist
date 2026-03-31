@@ -351,7 +351,7 @@ def gather_speech(action_url, hints=GENERAL_HINTS):
         input="speech",
         action=action_url,
         method="POST",
-        speech_timeout="3",
+        speech_timeout="2",
         language=LANGUAGE,
         enhanced=True,
         speech_model="phone_call",
@@ -571,8 +571,9 @@ def get_name():
     caller = request.values.get("From", "Unknown")
     retries = int(request.args.get("retries", 0))
 
-    # GPT-4 extracts the name from whatever they said
-    name = gpt_clean_name(speech) if speech else ""
+    # Use fast rule-based extraction for names — GPT overkill here
+    # extract_name handles all common patterns like "my name is John"
+    name = extract_name(speech) if speech else ""
 
     if not name:
         if retries >= MAX_RETRIES:
@@ -588,7 +589,16 @@ def get_name():
 
     next_url = build_url("/get_service", name=name, caller=caller)
     gather = gather_speech(next_url, hints=GENERAL_HINTS)
-    say(gather, f"Thanks {name}. What type of service do you need today? For example, plumbing, HVAC, electrical, or roofing.")
+
+    # Pre-generate this phrase immediately so it plays without delay
+    service_prompt = f"Thanks {name}. What type of service do you need today? For example, plumbing, HVAC, electrical, or roofing."
+    if openai_client and APP_URL:
+        key = hashlib.md5(service_prompt.encode()).hexdigest()
+        text_cache[key] = service_prompt
+        if key not in audio_cache:
+            threading.Thread(target=lambda: audio_cache.update({key: generate_speech(service_prompt)}), daemon=True).start()
+
+    say(gather, service_prompt)
     response.append(gather)
     response.redirect(next_url)
     return str(response)
