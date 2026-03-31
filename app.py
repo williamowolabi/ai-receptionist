@@ -308,14 +308,26 @@ def prewarm_audio():
     print("Audio pre-warm complete!")
 
 
+# Phrases that contain dynamic content (caller name/service)
+# These need OpenAI TTS since they change every call
+DYNAMIC_PHRASES = ["Thanks ", "Got it, you need", "Thank you", "Perfect, thank you"]
+
 def say(response, text):
-    """Play OpenAI TTS audio or fall back to Polly."""
-    if openai_client and APP_URL:
+    """
+    Smart TTS routing:
+    - Static phrases use Polly — instant, no network round trip
+    - Dynamic phrases with names use OpenAI TTS — personalized
+    This eliminates the biggest source of delay.
+    """
+    is_dynamic = any(phrase in text for phrase in DYNAMIC_PHRASES)
+
+    if openai_client and APP_URL and is_dynamic:
         key = hashlib.md5(text.encode()).hexdigest()
         text_cache[key] = text
         audio_url = f"{APP_URL}/audio/{key}"
         response.play(audio_url)
     else:
+        # Polly is instant — Twilio generates it internally
         response.say(text, voice="Polly.Joanna", language=LANGUAGE)
 
 
@@ -338,20 +350,20 @@ def serve_audio(key):
 # SPEECH GATHERING
 # ==============================================================================
 
-def gather_speech(action_url, hints=GENERAL_HINTS):
+def gather_speech(action_url, hints=GENERAL_HINTS, timeout="2"):
     """
     Gather speech with maximum noise filtering.
     - enhanced=True: Twilio best speech recognition
     - speech_model=phone_call: tuned for phone audio
     - hints: tells Twilio what words to expect
-    - speech_timeout=3: 3 seconds silence before processing
+    - timeout: configurable per step — shorter for yes/no, longer for descriptions
     - action_on_empty_result=True: always fires retry logic on noise
     """
     return Gather(
         input="speech",
         action=action_url,
         method="POST",
-        speech_timeout="2",
+        speech_timeout=timeout,
         language=LANGUAGE,
         enhanced=True,
         speech_model="phone_call",
@@ -557,7 +569,7 @@ def home():
 @app.route("/voice", methods=["GET", "POST"])
 def voice():
     response = VoiceResponse()
-    gather = gather_speech("/get_name", hints="my name is, first name, last name")
+    gather = gather_speech("/get_name", hints="my name is, first name, last name", timeout="2")
     say(gather, "Thank you for calling. You've reached the service desk. What is your full name please?")
     response.append(gather)
     response.redirect("/voice")
@@ -628,7 +640,7 @@ def get_service():
         return str(response)
 
     confirm_url = build_url("/confirm_service", name=name, service=service, caller=caller)
-    gather = gather_speech(confirm_url, hints="yes, no, yeah, nope, correct, wrong")
+    gather = gather_speech(confirm_url, hints="yes, no, yeah, nope, correct, wrong", timeout="2")
     say(gather, f"Got it, you need {service}. Is that correct? Please say yes or no.")
     response.append(gather)
     response.redirect(confirm_url)
@@ -668,7 +680,7 @@ def confirm_service():
         return str(response)
 
     retry_url = build_url("/confirm_service", name=name, service=service, caller=caller, retries=retries + 1)
-    gather = gather_speech(retry_url, hints="yes, no, yeah, nope")
+    gather = gather_speech(retry_url, hints="yes, no, yeah, nope", timeout="2")
     say(gather, "Sorry, I didn't catch that. Please say yes or no.")
     response.append(gather)
     response.redirect(retry_url)
@@ -699,7 +711,7 @@ def get_intent():
         return str(response)
 
     next_url = build_url("/get_urgency", name=name, service=service, intent=intent, caller=caller)
-    gather = gather_speech(next_url, hints="yes, no, urgent, not urgent, emergency")
+    gather = gather_speech(next_url, hints="yes, no, urgent, not urgent, emergency", timeout="2")
     say(gather, "Thank you. Is this an urgent or emergency situation? Please say yes or no.")
     response.append(gather)
     response.redirect(next_url)
@@ -729,14 +741,14 @@ def get_urgency():
             response.hangup()
             return str(response)
         retry_url = build_url("/get_urgency", name=name, service=service, intent=intent, caller=caller, retries=retries + 1)
-        gather = gather_speech(retry_url, hints="yes, no, urgent, not urgent")
+        gather = gather_speech(retry_url, hints="yes, no, urgent, not urgent", timeout="2")
         say(gather, "Sorry, please say yes if it is urgent or no if it is not.")
         response.append(gather)
         response.redirect(retry_url)
         return str(response)
 
     next_url = build_url("/get_details", name=name, service=service, intent=intent, urgency=urgency, caller=caller)
-    gather = gather_speech(next_url, hints=GENERAL_HINTS)
+    gather = gather_speech(next_url, hints=GENERAL_HINTS, timeout="4")
     say(gather, "Got it. Finally, please share any additional details you would like us to know.")
     response.append(gather)
     response.redirect(next_url)
