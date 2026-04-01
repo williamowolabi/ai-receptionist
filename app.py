@@ -351,15 +351,67 @@ def home():
 
 @app.route("/voice", methods=["GET", "POST"])
 def voice():
+    """
+    Greeting gives caller a chance to say emergency immediately.
+    If they say emergency or a panic keyword — bypass fires instantly.
+    Otherwise they say their name and normal flow continues.
+    """
     response = VoiceResponse()
     gather = gather_speech(
-        "/get_name",
-        hints="my name is, first name, last name, emergency, help",
+        "/triage",
+        hints="emergency, urgent, help, flooding, gas, fire, burst, my name is, first name",
         timeout="4"
     )
-    say(gather, "Thank you for calling. You've reached the service desk. What is your full name please?")
+    say(gather, (
+        "Thank you for calling. You've reached the service desk. "
+        "If this is an emergency please say emergency now. "
+        "Otherwise please tell us your name and we will be happy to help you."
+    ))
     response.append(gather)
     response.redirect("/voice")
+    return str(response)
+
+
+@app.route("/triage", methods=["POST"])
+def triage():
+    """
+    First words scanned immediately for emergency.
+    Emergency → alert owner and hang up.
+    Normal → extract name if given, otherwise ask for it.
+    """
+    response = VoiceResponse()
+    speech   = request.values.get("SpeechResult", "")
+    caller   = request.values.get("From", "Unknown")
+
+    # Emergency check on very first response
+    if is_emergency(speech) or "emergency" in speech.lower():
+        send_emergency_sms(caller, speech)
+        say(response, (
+            "I understand this is an emergency. "
+            "I am alerting our team right now. "
+            "Please call 911 if you are in immediate danger. "
+            "Someone will contact you within minutes. Goodbye."
+        ))
+        response.hangup()
+        return str(response)
+
+    # Try to extract name from first response
+    name = extract_name(speech)
+
+    if name:
+        # Name already given — skip straight to service
+        next_url = build_url("/get_service", name=name, caller=caller)
+        gather   = gather_speech(next_url, hints=GENERAL_HINTS)
+        say(gather, "Thanks " + name + ". What type of service do you need today? For example plumbing, HVAC, electrical, or roofing.")
+        response.append(gather)
+        response.redirect(next_url)
+    else:
+        # No name yet — ask for it
+        gather = gather_speech("/get_name", hints="my name is, first name, last name", timeout="3")
+        say(gather, "What is your full name please?")
+        response.append(gather)
+        response.redirect("/get_name")
+
     return str(response)
 
 
