@@ -50,10 +50,10 @@ GENERAL_HINTS = (
 # Filler phrases — played instantly while GPT processes
 FILLERS = [
     "One moment please.",
-    "Let me check on that for you.",
     "Sure, give me just a second.",
     "Got it, one moment.",
-    "Let me pull that up for you.",
+    "Jotting that down for you.",
+    "Got it, jotting that down.",
 ]
 
 # Pre-warm phrases — generated at startup so first call is instant
@@ -79,10 +79,10 @@ PREWARM_PHRASES = [
     "I understand this is an emergency. I am alerting our team right now. "
     "Please call 911 if you are in immediate danger. Someone will contact you within minutes. Goodbye.",
     "One moment please.",
-    "Let me check on that for you.",
     "Sure, give me just a second.",
     "Got it, one moment.",
-    "Let me pull that up for you.",
+    "Jotting that down for you.",
+    "Got it, jotting that down.",
 ]
 
 # ==============================================================================
