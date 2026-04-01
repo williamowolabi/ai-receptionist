@@ -926,6 +926,9 @@ def get_details():
 
     details = clean_text(speech) or "No extra details provided"
 
+    # Play filler instantly while CSV, GPT summary, and SMS all process
+    play_filler(response)
+
     # Check for landline — ask for mobile number to send SMS
     if is_likely_landline(caller):
         next_url = build_url(
@@ -944,8 +947,9 @@ def get_details():
     send_booking_sms(caller, name, service)
 
     say(response, (
-        "Thank you " + name + ". We have received your request for " + service + ". "
-        "I am sending a text message to your phone right now with a link to book your appointment. "
+        "Perfect, we have everything we need. "
+        "Thank you " + name + ". I am sending a text message to your phone right now "
+        "with a link to book your " + service + " appointment. "
         "Please check your messages. We look forward to helping you. Have a great day. Goodbye."
     ))
     response.hangup()
