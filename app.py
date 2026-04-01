@@ -8,6 +8,7 @@ import atexit
 import os
 import csv
 import hashlib
+import threading
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
@@ -17,22 +18,26 @@ app = Flask(__name__)
 # CONFIGURATION
 # ==============================================================================
 
-DATA_FILE          = "/var/data/calls.csv" if os.path.exists("/var/data") else "calls.csv"
-LANGUAGE           = "en-US"
-OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY")
-openai_client      = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-OPENAI_VOICE       = "nova"
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_PHONE_NUMBER= os.environ.get("TWILIO_PHONE_NUMBER")
-CALENDLY_LINK      = os.environ.get("CALENDLY_LINK", "https://calendly.com/your-link-here")
-APP_URL            = os.environ.get("APP_URL", "").rstrip("/")
-OWNER_PHONE        = os.environ.get("OWNER_PHONE", "")
-MAX_RETRIES        = 3
+DATA_FILE           = "/var/data/calls.csv" if os.path.exists("/var/data") else "calls.csv"
+LANGUAGE            = "en-US"
+OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY")
+openai_client       = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+OPENAI_VOICE        = "nova"
+TWILIO_ACCOUNT_SID  = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN   = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER")
+CALENDLY_LINK       = os.environ.get("CALENDLY_LINK", "https://calendly.com/your-link-here")
+APP_URL             = os.environ.get("APP_URL", "").rstrip("/")
+OWNER_PHONE         = os.environ.get("OWNER_PHONE", "")
+MAX_RETRIES         = 3
 
 # Audio caches
 text_cache  = {}
 audio_cache = {}
+
+# GPT caches — avoids calling GPT twice for same input
+gpt_name_cache    = {}
+gpt_service_cache = {}
 
 # Speech hints
 GENERAL_HINTS = (
@@ -41,6 +46,44 @@ GENERAL_HINTS = (
     "replace, fix, leak, broken, damage, emergency, flooding, "
     "gas, fire, smoke, sparking, burst"
 )
+
+# Filler phrases — played instantly while GPT processes
+FILLERS = [
+    "One moment please.",
+    "Let me check on that for you.",
+    "Sure, give me just a second.",
+    "Got it, one moment.",
+    "Let me pull that up for you.",
+]
+
+# Pre-warm phrases — generated at startup so first call is instant
+PREWARM_PHRASES = [
+    "Thank you for calling. You've reached the service desk. "
+    "If this is an emergency please say emergency now. "
+    "Otherwise please tell us your name and we will be happy to help you.",
+    "What is your full name please?",
+    "I didn't catch your name. Could you please say your full name?",
+    "I am having trouble hearing you. Please call back and we will be happy to help. Goodbye.",
+    "What type of service do you need today? For example plumbing, HVAC, electrical, or roofing.",
+    "I didn't catch that. Please tell me the type of service you need.",
+    "Is that correct? Please say yes or no.",
+    "No problem. What type of service do you need?",
+    "Sorry, I didn't catch that. Please say yes or no.",
+    "Great. Can you briefly describe what is going on and what you need help with?",
+    "I didn't catch that. Could you briefly describe what you need help with?",
+    "Thank you. Is this an urgent or emergency situation? Please say yes or no.",
+    "Sorry, please say yes if it is urgent or no if it is not.",
+    "Got it. Finally, please share any additional details you would like us to know.",
+    "Thank you. One last thing. What is the best mobile number to send your booking link to?",
+    "I didn't catch that number. Could you please say your ten digit mobile number?",
+    "I understand this is an emergency. I am alerting our team right now. "
+    "Please call 911 if you are in immediate danger. Someone will contact you within minutes. Goodbye.",
+    "One moment please.",
+    "Let me check on that for you.",
+    "Sure, give me just a second.",
+    "Got it, one moment.",
+    "Let me pull that up for you.",
+]
 
 # ==============================================================================
 # APSCHEDULER
@@ -54,10 +97,11 @@ scheduler.start()
 atexit.register(lambda: scheduler.shutdown(wait=False))
 
 # ==============================================================================
-# OPENAI TTS — nova voice only
+# OPENAI TTS — nova voice only, consistent throughout
 # ==============================================================================
 
 def generate_speech(text):
+    """Generate MP3 via OpenAI nova voice."""
     if not openai_client:
         return None
     try:
@@ -69,22 +113,55 @@ def generate_speech(text):
         )
         return resp.content
     except Exception as e:
-        print(f"TTS error: {e}")
+        print("TTS error: " + str(e))
         return None
 
 
+def prewarm_audio():
+    """Pre-generate audio for all common phrases at startup."""
+    if not openai_client or not APP_URL:
+        print("Skipping pre-warm — OpenAI or APP_URL not set")
+        return
+    print("Pre-warming audio cache...")
+    for phrase in PREWARM_PHRASES:
+        key = hashlib.md5(phrase.encode()).hexdigest()
+        text_cache[key] = phrase
+        data = generate_speech(phrase)
+        if data:
+            audio_cache[key] = data
+    print("Audio pre-warm complete!")
+
+
 def say(response, text):
-    """Play audio via OpenAI nova. Caches so repeated phrases never hit API twice."""
+    """
+    Play audio via OpenAI nova voice only.
+    Checks memory cache first — repeated phrases never hit API again.
+    Falls back to Polly only if OpenAI is not configured.
+    """
     if openai_client and APP_URL:
         key = hashlib.md5(text.encode()).hexdigest()
         text_cache[key] = text
-        response.play(f"{APP_URL}/audio/{key}")
+        response.play(APP_URL + "/audio/" + key)
     else:
         response.say(text, voice="Polly.Joanna", language=LANGUAGE)
 
 
+def play_filler(response):
+    """Play a filler phrase instantly while GPT processes."""
+    import random
+    filler = random.choice(FILLERS)
+    if openai_client and APP_URL:
+        key = hashlib.md5(filler.encode()).hexdigest()
+        if key in audio_cache:
+            text_cache[key] = filler
+            response.play(APP_URL + "/audio/" + key)
+            return
+    response.say(filler, voice="Polly.Joanna", language=LANGUAGE)
+
+
 @app.route("/audio/<key>", methods=["GET"])
 def serve_audio(key):
+    """Serve cached audio. Generate on demand if not yet cached."""
     text = text_cache.get(key)
     if not text:
         return "Not found", 404
@@ -95,6 +172,9 @@ def serve_audio(key):
         audio_cache[key] = data
     return Response(audio_cache[key], mimetype="audio/mpeg")
 
+
+# Pre-warm at startup in background
+threading.Thread(target=prewarm_audio, daemon=True).start()
 
 # ==============================================================================
 # SPEECH GATHERING
@@ -118,7 +198,7 @@ def gather_speech(action_url, hints=GENERAL_HINTS, timeout="3"):
 def build_url(path, **params):
     if not params:
         return path
-    return f"{path}?{urlencode(params)}"
+    return path + "?" + urlencode(params)
 
 
 # ==============================================================================
@@ -136,7 +216,115 @@ def clean_text(value):
     return value
 
 
-def extract_name(value):
+def yes_no_answer(text):
+    t = clean_text(text).lower()
+    if any(w in t for w in ["yes", "yeah", "yep", "correct", "right", "sure", "absolutely"]):
+        return "yes"
+    if any(w in t for w in ["no", "nope", "nah", "incorrect", "wrong", "negative"]):
+        return "no"
+    return ""
+
+
+def is_emergency(text):
+    """Instant keyword check — no GPT needed, fires in microseconds."""
+    if not text:
+        return False
+    t = text.lower()
+    keywords = [
+        "gas leak", "gas smell", "smell gas", "flooding", "flood",
+        "water everywhere", "pipe burst", "burst pipe", "house on fire",
+        "fire in", "sparking", "electrical fire", "electrocuted",
+        "exploded", "explosion", "collapse", "collapsed",
+        "carbon monoxide", "not breathing", "cant breathe",
+        "emergency"
+    ]
+    return any(k in t for k in keywords)
+
+
+def is_likely_landline(phone_number):
+    """Detect landline — ask for mobile number to send SMS."""
+    if not phone_number or phone_number == "Unknown":
+        return True
+    cleaned = phone_number.replace("+", "").replace("-", "").replace(" ", "")
+    if not cleaned.startswith("1") or len(cleaned) != 11:
+        return True
+    return False
+
+
+def parse_spoken_number(text):
+    """Convert spoken phone number to E.164 format."""
+    if not text:
+        return ""
+    word_to_digit = {
+        "zero": "0", "one": "1", "two": "2", "three": "3",
+        "four": "4", "five": "5", "six": "6", "seven": "7",
+        "eight": "8", "nine": "9", "oh": "0"
+    }
+    result = ""
+    for word in text.lower().split():
+        if word in word_to_digit:
+            result += word_to_digit[word]
+        elif word.isdigit():
+            result += word
+    digits = "".join(c for c in result if c.isdigit())
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return ""
+
+
+# ==============================================================================
+# GPT HELPERS
+# ==============================================================================
+
+def gpt_extract_name(speech):
+    """
+    Extract clean name from messy speech.
+    'Uhh yeah this is Mike sorry I am driving' -> 'Mike'
+    Caches results. Falls back to rule-based if GPT unavailable.
+    """
+    if not speech:
+        return ""
+
+    cache_key = speech.lower().strip()
+    if cache_key in gpt_name_cache:
+        return gpt_name_cache[cache_key]
+
+    if not openai_client:
+        return _rule_extract_name(speech)
+
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=10,
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a receptionist. Extract ONLY the person's name. "
+                        "Strip all filler words. Return just the clean name, properly capitalized. "
+                        "If no name found return: NONE"
+                    )
+                },
+                {"role": "user", "content": speech}
+            ]
+        )
+        name = resp.choices[0].message.content.strip()
+        if name == "NONE" or len(name) < 2 or len(name) > 50:
+            result = _rule_extract_name(speech)
+        else:
+            result = name.replace(".", "").replace(",", "").strip()
+        gpt_name_cache[cache_key] = result
+        return result
+    except Exception as e:
+        print("GPT name error: " + str(e))
+        return _rule_extract_name(speech)
+
+
+def _rule_extract_name(value):
+    """Rule-based name extraction fallback."""
     if not value:
         return ""
     text = value.strip()
@@ -156,27 +344,107 @@ def extract_name(value):
     return text.strip().title()
 
 
-def yes_no_answer(text):
-    t = clean_text(text).lower()
-    if any(w in t for w in ["yes", "yeah", "yep", "correct", "right", "sure", "absolutely"]):
-        return "yes"
-    if any(w in t for w in ["no", "nope", "nah", "incorrect", "wrong", "negative"]):
-        return "no"
-    return ""
+def gpt_extract_service_and_score(speech):
+    """
+    Identify service type AND lead score in one GPT call.
+    Returns (service, score) tuple.
+    Score: HIGH ($500+), MEDIUM ($150-500), LOW (under $150), EMERGENCY
+    Caches results.
+    """
+    if not speech:
+        return clean_text(speech), "MEDIUM"
+
+    cache_key = speech.lower().strip()
+    if cache_key in gpt_service_cache:
+        return gpt_service_cache[cache_key]
+
+    if not openai_client:
+        return clean_text(speech), "MEDIUM"
+
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=15,
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Return exactly: SERVICE|SCORE "
+                        "SERVICE: Plumbing, HVAC, Electrical, Roofing, Landscaping, "
+                        "Painting, Flooring, Handyman, EMERGENCY, or NONE "
+                        "SCORE: HIGH (over $500), MEDIUM ($150-500), LOW (under $150) "
+                        "EMERGENCY always gets HIGH. "
+                        "Examples: "
+                        "whole house AC replacement -> HVAC|HIGH "
+                        "leaky faucet -> Plumbing|LOW "
+                        "gas smell -> EMERGENCY|HIGH "
+                        "AC not cooling -> HVAC|MEDIUM "
+                        "new roof -> Roofing|HIGH "
+                        "outlet not working -> Electrical|MEDIUM"
+                    )
+                },
+                {"role": "user", "content": speech}
+            ]
+        )
+        raw = resp.choices[0].message.content.strip()
+        parts = raw.split("|")
+        service = parts[0].strip() if len(parts) >= 1 else clean_text(speech)
+        score   = parts[1].strip() if len(parts) >= 2 else "MEDIUM"
+        if score not in ["HIGH", "MEDIUM", "LOW"]:
+            score = "MEDIUM"
+        if service in ["NONE", ""]:
+            service = clean_text(speech)
+        result = (service, score)
+        gpt_service_cache[cache_key] = result
+        print("Service: " + service + " | Score: " + score)
+        return result
+    except Exception as e:
+        print("GPT service error: " + str(e))
+        return clean_text(speech), "MEDIUM"
 
 
-def is_emergency(text):
-    if not text:
-        return False
-    t = text.lower()
-    keywords = [
-        "gas leak", "gas smell", "smell gas", "flooding", "flood",
-        "water everywhere", "pipe burst", "burst pipe", "house on fire",
-        "fire in", "sparking", "electrical fire", "electrocuted",
-        "exploded", "explosion", "collapse", "collapsed",
-        "carbon monoxide", "not breathing", "cant breathe"
-    ]
-    return any(k in t for k in keywords)
+def gpt_build_lead_summary(name, service, intent, urgency, details, caller, score):
+    """
+    Build elite dollar-focused lead summary.
+    HIGH VALUE: John needs full water heater replacement (~$2800). Call him back first.
+    """
+    if not openai_client:
+        return None
+    try:
+        prompt = (
+            "Name: " + name + "\n"
+            "Service: " + service + "\n"
+            "Issue: " + intent + "\n"
+            "Urgency: " + urgency + "\n"
+            "Details: " + details
+        )
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=100,
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a business advisor for a home service company. "
+                        "Summarize this lead in 2 sentences MAX. "
+                        "Always include the job description and a realistic dollar estimate. "
+                        "Start with the value tier: "
+                        "HIGH VALUE (over $1000), MID RANGE ($300-$1000), QUICK JOB (under $300). "
+                        "End with a one-line action for the owner. "
+                        "Example: HIGH VALUE: John needs a full water heater replacement (~$2800). "
+                        "Call him back first, do not let this go to voicemail. "
+                        "No greetings. No sign-offs. Be direct."
+                    )
+                },
+                {"role": "user", "content": prompt}
+            ]
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        print("GPT summary error: " + str(e))
+        return None
 
 
 # ==============================================================================
@@ -192,36 +460,49 @@ def send_sms(to_number, body):
             return False
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         client.messages.create(body=body, from_=TWILIO_PHONE_NUMBER, to=to_number)
-        print(f"SMS sent to {to_number}")
+        print("SMS sent to " + to_number)
         return True
     except Exception as e:
-        print(f"SMS failed: {e}")
+        print("SMS failed: " + str(e))
         return False
 
 
 def send_booking_sms(to_number, name, service):
     body = (
         "Hi " + name + ", thanks for calling!\n\n"
-        "To book your " + service + " appointment click below:\n"
+        "To book your " + service + " appointment:\n"
         + CALENDLY_LINK + "\n\n"
         "We look forward to helping you!"
     )
     send_sms(to_number, body)
 
 
-def send_lead_alert(name, caller, service, urgency, intent):
+def send_lead_alert(name, caller, service, urgency, intent, details, score):
     if not OWNER_PHONE:
         return
+    summary = gpt_build_lead_summary(name, service, intent, urgency, details, caller, score)
     urgency_flag = "URGENT" if urgency == "Urgent" else "Standard"
-    body = (
-        "New Lead - NextReceptionist\n\n"
-        "[" + urgency_flag + "]\n"
-        "Name: " + name + "\n"
-        "Service: " + service + "\n"
-        "Issue: " + intent + "\n"
-        "Phone: " + caller + "\n\n"
-        "Booking link sent to customer."
-    )
+
+    if summary:
+        body = (
+            "New Lead - NextReceptionist\n\n"
+            + summary + "\n\n"
+            "Name: " + name + "\n"
+            "Phone: " + caller + "\n"
+            "Service: " + service + "\n"
+            "Urgency: " + urgency_flag + "\n\n"
+            "Booking link sent to customer."
+        )
+    else:
+        body = (
+            "New Lead - NextReceptionist\n\n"
+            "[" + urgency_flag + "]\n"
+            "Name: " + name + "\n"
+            "Phone: " + caller + "\n"
+            "Service: " + service + "\n"
+            "Issue: " + intent + "\n\n"
+            "Booking link sent to customer."
+        )
     send_sms(OWNER_PHONE, body)
 
 
@@ -252,6 +533,41 @@ def send_emergency_sms(caller, speech):
 
 
 # ==============================================================================
+# EMERGENCY RESPONSE — live dial to owner
+# ==============================================================================
+
+def emergency_response(response, caller, speech):
+    """
+    Immediate emergency handler.
+    1. Plays pre-recorded message instantly
+    2. Live dials owner so caller reaches a real person
+    3. SMS alert fires to owner
+    """
+    send_emergency_sms(caller, speech)
+    say(response, (
+        "I understand this is an emergency. "
+        "I am connecting you with a technician right now. "
+        "Please stay on the line. If this is life threatening call 911 immediately."
+    ))
+    if OWNER_PHONE:
+        dial = Dial(action="/call_ended", method="POST", timeout=30)
+        dial.number(OWNER_PHONE)
+        response.append(dial)
+        say(response, (
+            "We were unable to reach a technician directly. "
+            "Someone will call you back within minutes. "
+            "If this is life threatening please call 911 immediately. Goodbye."
+        ))
+    response.hangup()
+    return str(response)
+
+
+@app.route("/call_ended", methods=["POST"])
+def call_ended():
+    return str(VoiceResponse())
+
+
+# ==============================================================================
 # CSV
 # ==============================================================================
 
@@ -263,15 +579,15 @@ def ensure_csv_exists():
         with open(DATA_FILE, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["timestamp", "name", "caller_phone",
-                             "service", "intent", "urgency", "details"])
+                             "service", "intent", "urgency", "details", "score"])
 
 
-def append_to_csv(name, caller, service, intent, urgency, details):
+def append_to_csv(name, caller, service, intent, urgency, details, score):
     with open(DATA_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            name, caller, service, intent, urgency, details
+            name, caller, service, intent, urgency, details, score
         ])
     print("Call saved to CSV")
 
@@ -280,16 +596,14 @@ ensure_csv_exists()
 
 
 # ==============================================================================
-# NO-SHOW SAVER
-# Schedules a confirmation call the day before every appointment.
-# Triggered by Calendly webhook when a booking is made.
+# NO-SHOW SAVER — APScheduler confirmation calls
 # ==============================================================================
 
 def make_confirmation_call(customer_phone, customer_name, appointment_time, calendly_link):
-    """Make outbound confirmation call the day before the appointment."""
+    """Make outbound day-before confirmation call."""
     try:
         if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, APP_URL]):
-            print("Missing credentials — skipping confirmation call")
+            print("Missing credentials for confirmation call")
             return
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         params = urlencode({
@@ -305,27 +619,21 @@ def make_confirmation_call(customer_phone, customer_name, appointment_time, cale
             method="GET",
             timeout=30
         )
-        print("Confirmation call initiated to " + customer_phone + " SID: " + call.sid)
+        print("Confirmation call to " + customer_phone + " SID: " + call.sid)
     except Exception as e:
         print("Confirmation call failed: " + str(e))
 
 
 def schedule_confirmation_call(customer_phone, customer_name, appointment_dt, calendly_link):
-    """Schedule confirmation call for 10 AM the day before. Uses APScheduler."""
+    """Schedule confirmation call for 10 AM the day before via APScheduler."""
     try:
         call_time = appointment_dt - timedelta(days=1)
         call_time = call_time.replace(hour=10, minute=0, second=0, microsecond=0)
         now = datetime.now()
-
         if call_time <= now:
             call_time = now + timedelta(minutes=30)
-            print("Appointment soon — confirmation call in 30 minutes")
-        else:
-            print("Confirmation call scheduled for " + call_time.strftime("%Y-%m-%d at 10:00 AM"))
-
         formatted_time = appointment_dt.strftime("%B %-d at %-I:%M %p")
         job_id = "confirm_" + customer_phone + "_" + str(int(appointment_dt.timestamp()))
-
         scheduler.add_job(
             func=make_confirmation_call,
             trigger="date",
@@ -335,9 +643,9 @@ def schedule_confirmation_call(customer_phone, customer_name, appointment_dt, ca
             replace_existing=True,
             misfire_grace_time=3600
         )
-        print("APScheduler job created: " + job_id)
+        print("Confirmation scheduled: " + job_id)
     except Exception as e:
-        print("Schedule confirmation error: " + str(e))
+        print("Schedule error: " + str(e))
 
 
 # ==============================================================================
@@ -351,11 +659,7 @@ def home():
 
 @app.route("/voice", methods=["GET", "POST"])
 def voice():
-    """
-    Greeting gives caller a chance to say emergency immediately.
-    If they say emergency or a panic keyword — bypass fires instantly.
-    Otherwise they say their name and normal flow continues.
-    """
+    """Greeting — emergency option first, then ask for name."""
     response = VoiceResponse()
     gather = gather_speech(
         "/triage",
@@ -375,38 +679,31 @@ def voice():
 @app.route("/triage", methods=["POST"])
 def triage():
     """
-    First words scanned immediately for emergency.
-    Emergency → alert owner and hang up.
-    Normal → extract name if given, otherwise ask for it.
+    First response scanner — checks emergency before anything else.
+    Emergency fires in under 5 seconds. Normal callers flow to name.
     """
-    response = VoiceResponse()
-    speech   = request.values.get("SpeechResult", "")
-    caller   = request.values.get("From", "Unknown")
+    response    = VoiceResponse()
+    speech      = request.values.get("SpeechResult", "")
+    caller      = request.values.get("From", "Unknown")
 
-    # Emergency check on very first response
-    if is_emergency(speech) or "emergency" in speech.lower():
-        send_emergency_sms(caller, speech)
-        say(response, (
-            "I understand this is an emergency. "
-            "I am alerting our team right now. "
-            "Please call 911 if you are in immediate danger. "
-            "Someone will contact you within minutes. Goodbye."
-        ))
-        response.hangup()
-        return str(response)
+    # Emergency check on very first words — instant keyword scan
+    if is_emergency(speech):
+        return emergency_response(response, caller, speech)
 
     # Try to extract name from first response
-    name = extract_name(speech)
+    # Many callers say "Hi my name is John" right away
+    name = gpt_extract_name(speech) if speech else ""
 
     if name:
-        # Name already given — skip straight to service
         next_url = build_url("/get_service", name=name, caller=caller)
         gather   = gather_speech(next_url, hints=GENERAL_HINTS)
-        say(gather, "Thanks " + name + ". What type of service do you need today? For example plumbing, HVAC, electrical, or roofing.")
+        say(gather, (
+            "Thanks " + name + ". What type of service do you need today? "
+            "For example plumbing, HVAC, electrical, or roofing."
+        ))
         response.append(gather)
         response.redirect(next_url)
     else:
-        # No name yet — ask for it
         gather = gather_speech("/get_name", hints="my name is, first name, last name", timeout="3")
         say(gather, "What is your full name please?")
         response.append(gather)
@@ -418,17 +715,16 @@ def triage():
 @app.route("/get_name", methods=["POST"])
 def get_name():
     response = VoiceResponse()
-    speech  = request.values.get("SpeechResult", "")
-    caller  = request.values.get("From", "Unknown")
-    retries = int(request.args.get("retries", 0))
+    speech   = request.values.get("SpeechResult", "")
+    caller   = request.values.get("From", "Unknown")
+    retries  = int(request.args.get("retries", 0))
 
     if is_emergency(speech):
-        send_emergency_sms(caller, speech)
-        say(response, "I understand this is an emergency. I am alerting our team right now. Please call 911 if you are in immediate danger. Goodbye.")
-        response.hangup()
-        return str(response)
+        return emergency_response(response, caller, speech)
 
-    name = extract_name(speech)
+    # Play filler while GPT extracts name
+    play_filler(response)
+    name = gpt_extract_name(speech) if speech else ""
 
     if not name:
         if retries >= MAX_RETRIES:
@@ -436,7 +732,7 @@ def get_name():
             response.hangup()
             return str(response)
         retry_url = build_url("/get_name", retries=retries + 1)
-        gather = gather_speech(retry_url, hints="my name is, first name, last name", timeout="3")
+        gather    = gather_speech(retry_url, hints="my name is, first name, last name", timeout="3")
         say(gather, "I didn't catch your name. Could you please say your full name?")
         response.append(gather)
         response.redirect(retry_url)
@@ -444,7 +740,10 @@ def get_name():
 
     next_url = build_url("/get_service", name=name, caller=caller)
     gather   = gather_speech(next_url, hints=GENERAL_HINTS)
-    say(gather, "Thanks " + name + ". What type of service do you need today? For example plumbing, HVAC, electrical, or roofing.")
+    say(gather, (
+        "Thanks " + name + ". What type of service do you need today? "
+        "For example plumbing, HVAC, electrical, or roofing."
+    ))
     response.append(gather)
     response.redirect(next_url)
     return str(response)
@@ -453,18 +752,31 @@ def get_name():
 @app.route("/get_service", methods=["POST"])
 def get_service():
     response = VoiceResponse()
-    speech  = request.values.get("SpeechResult", "")
-    name    = request.args.get("name", "")
-    caller  = request.args.get("caller", "Unknown")
-    retries = int(request.args.get("retries", 0))
+    speech   = request.values.get("SpeechResult", "")
+    name     = request.args.get("name", "")
+    caller   = request.args.get("caller", "Unknown")
+    retries  = int(request.args.get("retries", 0))
 
     if is_emergency(speech):
-        send_emergency_sms(caller, speech)
-        say(response, "I understand this is an emergency. I am alerting our team right now. Please call 911 if you are in immediate danger. Goodbye.")
-        response.hangup()
-        return str(response)
+        return emergency_response(response, caller, speech)
 
-    service = clean_text(speech)
+    # Play filler while GPT identifies service and scores lead
+    play_filler(response)
+    service, score = gpt_extract_service_and_score(speech) if speech else ("", "MEDIUM")
+
+    # Short-circuit: service + panic keyword = emergency
+    PANIC_COMBOS = {
+        "Plumbing":   ["flood", "burst", "flooding", "gushing", "water everywhere"],
+        "HVAC":       ["gas", "gas smell", "carbon monoxide", "explosion"],
+        "Electrical": ["sparking", "sparks", "fire", "shock", "electrocuted"],
+        "Roofing":    ["collapse", "collapsed", "caved in"],
+    }
+    speech_lower = speech.lower()
+    if any(w in speech_lower for w in PANIC_COMBOS.get(service, [])):
+        return emergency_response(response, caller, speech)
+
+    if service == "EMERGENCY":
+        return emergency_response(response, caller, speech)
 
     if not service:
         if retries >= MAX_RETRIES:
@@ -478,7 +790,7 @@ def get_service():
         response.redirect(retry_url)
         return str(response)
 
-    confirm_url = build_url("/confirm_service", name=name, service=service, caller=caller)
+    confirm_url = build_url("/confirm_service", name=name, service=service, caller=caller, score=score)
     gather      = gather_speech(confirm_url, hints="yes, no, yeah, nope, correct, wrong", timeout="3")
     say(gather, "Got it, you need " + service + ". Is that correct? Please say yes or no.")
     response.append(gather)
@@ -489,16 +801,17 @@ def get_service():
 @app.route("/confirm_service", methods=["POST"])
 def confirm_service():
     response = VoiceResponse()
-    speech  = request.values.get("SpeechResult", "")
-    name    = request.args.get("name", "")
-    service = request.args.get("service", "")
-    caller  = request.args.get("caller", "Unknown")
-    retries = int(request.args.get("retries", 0))
+    speech   = request.values.get("SpeechResult", "")
+    name     = request.args.get("name", "")
+    service  = request.args.get("service", "")
+    caller   = request.args.get("caller", "Unknown")
+    score    = request.args.get("score", "MEDIUM")
+    retries  = int(request.args.get("retries", 0))
 
     answer = yes_no_answer(speech)
 
     if answer == "yes":
-        next_url = build_url("/get_intent", name=name, service=service, caller=caller)
+        next_url = build_url("/get_intent", name=name, service=service, caller=caller, score=score)
         gather   = gather_speech(next_url, hints=GENERAL_HINTS, timeout="4")
         say(gather, "Great. Can you briefly describe what is going on and what you need help with?")
         response.append(gather)
@@ -518,7 +831,7 @@ def confirm_service():
         response.hangup()
         return str(response)
 
-    retry_url = build_url("/confirm_service", name=name, service=service, caller=caller, retries=retries + 1)
+    retry_url = build_url("/confirm_service", name=name, service=service, caller=caller, score=score, retries=retries + 1)
     gather    = gather_speech(retry_url, hints="yes, no", timeout="3")
     say(gather, "Sorry, I didn't catch that. Please say yes or no.")
     response.append(gather)
@@ -529,18 +842,17 @@ def confirm_service():
 @app.route("/get_intent", methods=["POST"])
 def get_intent():
     response = VoiceResponse()
-    speech  = request.values.get("SpeechResult", "")
-    name    = request.args.get("name", "")
-    service = request.args.get("service", "")
-    caller  = request.args.get("caller", "Unknown")
-    retries = int(request.args.get("retries", 0))
+    speech   = request.values.get("SpeechResult", "")
+    name     = request.args.get("name", "")
+    service  = request.args.get("service", "")
+    caller   = request.args.get("caller", "Unknown")
+    score    = request.args.get("score", "MEDIUM")
+    retries  = int(request.args.get("retries", 0))
 
     if is_emergency(speech):
-        send_emergency_sms(caller, speech)
-        say(response, "I understand this is an emergency. I am alerting our team right now. Please call 911 if you are in immediate danger. Goodbye.")
-        response.hangup()
-        return str(response)
+        return emergency_response(response, caller, speech)
 
+    play_filler(response)
     intent = clean_text(speech)
 
     if not intent:
@@ -548,14 +860,14 @@ def get_intent():
             say(response, "I am having trouble hearing you. Please call back and we will be happy to help. Goodbye.")
             response.hangup()
             return str(response)
-        retry_url = build_url("/get_intent", name=name, service=service, caller=caller, retries=retries + 1)
+        retry_url = build_url("/get_intent", name=name, service=service, caller=caller, score=score, retries=retries + 1)
         gather    = gather_speech(retry_url, hints=GENERAL_HINTS, timeout="4")
         say(gather, "I didn't catch that. Could you briefly describe what you need help with?")
         response.append(gather)
         response.redirect(retry_url)
         return str(response)
 
-    next_url = build_url("/get_urgency", name=name, service=service, intent=intent, caller=caller)
+    next_url = build_url("/get_urgency", name=name, service=service, intent=intent, caller=caller, score=score)
     gather   = gather_speech(next_url, hints="yes, no, urgent, not urgent, emergency", timeout="3")
     say(gather, "Thank you. Is this an urgent or emergency situation? Please say yes or no.")
     response.append(gather)
@@ -566,12 +878,13 @@ def get_intent():
 @app.route("/get_urgency", methods=["POST"])
 def get_urgency():
     response = VoiceResponse()
-    speech  = request.values.get("SpeechResult", "")
-    name    = request.args.get("name", "")
-    service = request.args.get("service", "")
-    intent  = request.args.get("intent", "")
-    caller  = request.args.get("caller", "Unknown")
-    retries = int(request.args.get("retries", 0))
+    speech   = request.values.get("SpeechResult", "")
+    name     = request.args.get("name", "")
+    service  = request.args.get("service", "")
+    intent   = request.args.get("intent", "")
+    caller   = request.args.get("caller", "Unknown")
+    score    = request.args.get("score", "MEDIUM")
+    retries  = int(request.args.get("retries", 0))
 
     answer = yes_no_answer(speech)
 
@@ -585,14 +898,14 @@ def get_urgency():
             say(response, "I am having trouble hearing you. Please call back and we will be happy to help. Goodbye.")
             response.hangup()
             return str(response)
-        retry_url = build_url("/get_urgency", name=name, service=service, intent=intent, caller=caller, retries=retries + 1)
+        retry_url = build_url("/get_urgency", name=name, service=service, intent=intent, caller=caller, score=score, retries=retries + 1)
         gather    = gather_speech(retry_url, hints="yes, no, urgent, not urgent", timeout="3")
         say(gather, "Sorry, please say yes if it is urgent or no if it is not.")
         response.append(gather)
         response.redirect(retry_url)
         return str(response)
 
-    next_url = build_url("/get_details", name=name, service=service, intent=intent, urgency=urgency, caller=caller)
+    next_url = build_url("/get_details", name=name, service=service, intent=intent, urgency=urgency, caller=caller, score=score)
     gather   = gather_speech(next_url, hints=GENERAL_HINTS, timeout="4")
     say(gather, "Got it. Finally, please share any additional details you would like us to know.")
     response.append(gather)
@@ -603,21 +916,83 @@ def get_urgency():
 @app.route("/get_details", methods=["POST"])
 def get_details():
     response = VoiceResponse()
-    speech  = request.values.get("SpeechResult", "")
-    name    = request.args.get("name", "")
-    service = request.args.get("service", "")
-    intent  = request.args.get("intent", "")
-    urgency = request.args.get("urgency", "")
-    caller  = request.args.get("caller", "Unknown")
+    speech   = request.values.get("SpeechResult", "")
+    name     = request.args.get("name", "")
+    service  = request.args.get("service", "")
+    intent   = request.args.get("intent", "")
+    urgency  = request.args.get("urgency", "")
+    caller   = request.args.get("caller", "Unknown")
+    score    = request.args.get("score", "MEDIUM")
 
     details = clean_text(speech) or "No extra details provided"
 
-    append_to_csv(name, caller, service, intent, urgency, details)
-    send_lead_alert(name, caller, service, urgency, intent)
+    # Check for landline — ask for mobile number to send SMS
+    if is_likely_landline(caller):
+        next_url = build_url(
+            "/get_mobile",
+            name=name, caller=caller, service=service,
+            intent=intent, urgency=urgency, details=details, score=score
+        )
+        gather = gather_speech(next_url, hints="my number is, cell, mobile", timeout="4")
+        say(gather, "Thank you. One last thing. What is the best mobile number to send your booking link to? Please say your ten digit number.")
+        response.append(gather)
+        response.redirect(next_url)
+        return str(response)
+
+    append_to_csv(name, caller, service, intent, urgency, details, score)
+    send_lead_alert(name, caller, service, urgency, intent, details, score)
     send_booking_sms(caller, name, service)
 
     say(response, (
         "Thank you " + name + ". We have received your request for " + service + ". "
+        "I am sending a text message to your phone right now with a link to book your appointment. "
+        "Please check your messages. We look forward to helping you. Have a great day. Goodbye."
+    ))
+    response.hangup()
+    return str(response)
+
+
+@app.route("/get_mobile", methods=["POST"])
+def get_mobile():
+    """Collect mobile number from landline callers."""
+    response = VoiceResponse()
+    speech   = request.values.get("SpeechResult", "")
+    name     = request.args.get("name", "")
+    caller   = request.args.get("caller", "Unknown")
+    service  = request.args.get("service", "")
+    intent   = request.args.get("intent", "")
+    urgency  = request.args.get("urgency", "")
+    details  = request.args.get("details", "No extra details provided")
+    score    = request.args.get("score", "MEDIUM")
+    retries  = int(request.args.get("retries", 0))
+
+    mobile = parse_spoken_number(speech)
+
+    if not mobile:
+        if retries >= MAX_RETRIES:
+            append_to_csv(name, caller, service, intent, urgency, details, score)
+            send_lead_alert(name, caller, service, urgency, intent, details, score)
+            say(response, "I was unable to get your number. We will follow up with you soon. Goodbye.")
+            response.hangup()
+            return str(response)
+        retry_url = build_url(
+            "/get_mobile",
+            name=name, caller=caller, service=service,
+            intent=intent, urgency=urgency, details=details, score=score,
+            retries=retries + 1
+        )
+        gather = gather_speech(retry_url, hints="my number is, cell, mobile", timeout="4")
+        say(gather, "I didn't catch that number. Could you please say your ten digit mobile number?")
+        response.append(gather)
+        response.redirect(retry_url)
+        return str(response)
+
+    append_to_csv(name, mobile, service, intent, urgency, details, score)
+    send_lead_alert(name, mobile, service, urgency, intent, details, score)
+    send_booking_sms(mobile, name, service)
+
+    say(response, (
+        "Perfect, thank you " + name + ". We have received your request for " + service + ". "
         "I am sending a text message to your phone right now with a link to book your appointment. "
         "Please check your messages. We look forward to helping you. Have a great day. Goodbye."
     ))
@@ -631,13 +1006,11 @@ def get_details():
 
 @app.route("/confirm-appointment", methods=["GET", "POST"])
 def confirm_appointment():
-    """TwiML for outbound confirmation call."""
     response         = VoiceResponse()
     name             = request.args.get("name", "there")
     appointment_time = request.args.get("time", "your appointment")
     phone            = request.args.get("phone", "")
     calendly         = request.args.get("calendly", CALENDLY_LINK)
-
     params = urlencode({
         "name": name, "time": appointment_time,
         "phone": phone, "calendly": calendly
@@ -662,7 +1035,6 @@ def confirm_appointment():
 
 @app.route("/confirm-response", methods=["POST"])
 def confirm_response():
-    """Handle keypress from confirmation call."""
     response         = VoiceResponse()
     digit            = request.values.get("Digits", "")
     name             = request.args.get("name", "there")
@@ -683,7 +1055,6 @@ def confirm_response():
                 "Time: " + appointment_time + "\n"
                 "Phone: " + phone
             )
-
     elif digit == "2":
         response.say(
             "No problem " + name + "! I am sending you a link to pick a new time. Goodbye!",
@@ -702,7 +1073,6 @@ def confirm_response():
                 "Original: " + appointment_time + "\n"
                 "Phone: " + phone
             )
-
     else:
         response.say("We did not receive a response. Please call us back. Goodbye.", voice="Polly.Joanna", language="en-US")
         response.hangup()
@@ -714,8 +1084,7 @@ def confirm_response():
 def calendly_webhook():
     """
     Triggered when customer books via Calendly.
-    Notifies owner and schedules day-before confirmation call.
-    Set up in Calendly: Integrations -> Webhooks -> invitee.created
+    Set in Calendly: Integrations -> Webhooks -> invitee.created
     URL: https://your-app.onrender.com/calendly-webhook
     """
     try:
@@ -749,10 +1118,7 @@ def calendly_webhook():
             send_sms(OWNER_PHONE, body)
 
         if customer_phone:
-            schedule_confirmation_call(
-                customer_phone, customer_name,
-                appointment_dt, CALENDLY_LINK
-            )
+            schedule_confirmation_call(customer_phone, customer_name, appointment_dt, CALENDLY_LINK)
 
         return {"status": "ok"}, 200
 
