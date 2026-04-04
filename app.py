@@ -35,7 +35,7 @@ MAX_RETRIES         = 3
 text_cache  = {}
 audio_cache = {}
 
-# GPT caches — avoids calling GPT twice for same input
+# GPT caches
 gpt_name_cache    = {}
 gpt_service_cache = {}
 
@@ -47,43 +47,52 @@ GENERAL_HINTS = (
     "gas, fire, smoke, sparking, burst"
 )
 
-# Filler phrases — played instantly while GPT processes
-FILLERS = [
-    "One moment please.",
-    "Sure, give me just a second.",
-    "Got it, one moment.",
-    "Jotting that down for you.",
-    "Got it, jotting that down.",
-]
+# ==============================================================================
+# STATIC AUDIO KEYS — Pre-recorded phrases served instantly (<500ms)
+# Every fixed question in the call flow has a key here.
+# Only dynamic responses (name, service, goodbye) use say().
+# ==============================================================================
 
-# Pre-warm phrases — generated at startup so first call is instant
-PREWARM_PHRASES = [
-    "Thank you for calling. You've reached the service desk. "
-    "If this is an emergency please say emergency now. "
-    "Otherwise please tell us your name and we will be happy to help you.",
-    "What is your full name please?",
-    "I didn't catch your name. Could you please say your full name?",
-    "I am having trouble hearing you. Please call back and we will be happy to help. Goodbye.",
-    "What type of service do you need today? For example plumbing, HVAC, electrical, or roofing.",
-    "I didn't catch that. Please tell me the type of service you need.",
-    "Is that correct? Please say yes or no.",
-    "No problem. What type of service do you need?",
-    "Sorry, I didn't catch that. Please say yes or no.",
-    "Great. Can you briefly describe what is going on and what you need help with?",
-    "I didn't catch that. Could you briefly describe what you need help with?",
-    "Thank you. Is this an urgent or emergency situation? Please say yes or no.",
-    "Sorry, please say yes if it is urgent or no if it is not.",
-    "Got it. Finally, please share any additional details you would like us to know.",
-    "Thank you. One last thing. What is the best mobile number to send your booking link to?",
-    "I didn't catch that number. Could you please say your ten digit mobile number?",
-    "I understand this is an emergency. I am alerting our team right now. "
-    "Please call 911 if you are in immediate danger. Someone will contact you within minutes. Goodbye.",
-    "One moment please.",
-    "Sure, give me just a second.",
-    "Got it, one moment.",
-    "Jotting that down for you.",
-    "Got it, jotting that down.",
-]
+STATIC = {
+    "greeting": (
+        "Thank you for calling. You've reached the service desk. "
+        "If this is an emergency please say emergency now. "
+        "Otherwise please tell us your name and we will be happy to help you."
+    ),
+    "ask_name": "What is your full name please?",
+    "retry_name": "I didn't catch your name. Could you please say your full name?",
+    "cant_hear": "I am having trouble hearing you. Please call back and we will be happy to help. Goodbye.",
+    "ask_service": "What type of service do you need today? For example plumbing, HVAC, electrical, or roofing.",
+    "retry_service": "I didn't catch that. Please tell me the type of service you need, like plumbing, HVAC, or electrical.",
+    "ask_confirm": "Is that correct? Please say yes or no.",
+    "retry_confirm": "Sorry, I didn't catch that. Please say yes or no.",
+    "no_problem_service": "No problem. What type of service do you need?",
+    "ask_intent": "Great. Can you briefly describe what is going on and what you need help with?",
+    "retry_intent": "I didn't catch that. Could you briefly describe what you need help with?",
+    "ask_urgency": "Thank you. Is this an urgent or emergency situation? Please say yes or no.",
+    "retry_urgency": "Sorry, please say yes if it is urgent or no if it is not.",
+    "ask_details": "Got it. Finally, please share any additional details you would like us to know.",
+    "ask_mobile": "Thank you. One last thing. What is the best mobile number to send your booking link to? Please say your ten digit number.",
+    "retry_mobile": "I didn't catch that number. Could you please say your ten digit mobile number?",
+    "no_mobile": "I was unable to get your number. We will follow up with you soon. Goodbye.",
+    "emergency_msg": (
+        "I understand this is an emergency. "
+        "I am connecting you with a technician right now. "
+        "Please stay on the line. If this is life threatening call 911 immediately."
+    ),
+    "emergency_no_answer": (
+        "We were unable to reach a technician directly. "
+        "Someone will call you back within minutes. "
+        "If this is life threatening please call 911 immediately. Goodbye."
+    ),
+    "filler_1": "One moment please.",
+    "filler_2": "Sure, give me just a second.",
+    "filler_3": "Got it, one moment.",
+    "filler_4": "Jotting that down for you.",
+    "filler_5": "Got it, jotting that down.",
+}
+
+FILLER_KEYS = ["filler_1", "filler_2", "filler_3", "filler_4", "filler_5"]
 
 # ==============================================================================
 # APSCHEDULER
@@ -97,7 +106,7 @@ scheduler.start()
 atexit.register(lambda: scheduler.shutdown(wait=False))
 
 # ==============================================================================
-# OPENAI TTS — nova voice only, consistent throughout
+# OPENAI TTS
 # ==============================================================================
 
 def generate_speech(text):
@@ -118,25 +127,48 @@ def generate_speech(text):
 
 
 def prewarm_audio():
-    """Pre-generate audio for all common phrases at startup."""
+    """
+    Pre-generate ALL static audio at startup.
+    First call is instant — every phrase is already in memory.
+    """
     if not openai_client or not APP_URL:
         print("Skipping pre-warm — OpenAI or APP_URL not set")
         return
-    print("Pre-warming audio cache...")
-    for phrase in PREWARM_PHRASES:
-        key = hashlib.md5(phrase.encode()).hexdigest()
+    print("Pre-warming static audio cache...")
+    for key, phrase in STATIC.items():
         text_cache[key] = phrase
         data = generate_speech(phrase)
         if data:
             audio_cache[key] = data
-    print("Audio pre-warm complete!")
+            print("  Cached: " + key)
+    print("Audio pre-warm complete — " + str(len(audio_cache)) + " phrases ready!")
+
+
+def static_say(response_or_gather, key):
+    """
+    Play a pre-recorded static phrase instantly.
+    Uses the STATIC dict key directly — no hashing needed.
+    Falls back to Polly if OpenAI not configured.
+    Under 500ms response time for cached audio.
+    """
+    text = STATIC.get(key, "")
+    if not text:
+        print("WARNING: Unknown static key: " + key)
+        return
+    if openai_client and APP_URL:
+        # Register text so /audio/<key> can serve it
+        text_cache[key] = text
+        response_or_gather.play(APP_URL + "/audio/" + key)
+    else:
+        response_or_gather.say(text, voice="Polly.Joanna", language=LANGUAGE)
 
 
 def say(response, text):
     """
-    Play audio via OpenAI nova voice only.
-    Checks memory cache first — repeated phrases never hit API again.
-    Falls back to Polly only if OpenAI is not configured.
+    Play dynamic audio via OpenAI nova voice.
+    Use ONLY for personalized responses (name, service, goodbye).
+    For fixed phrases use static_say() instead.
+    Checks memory cache first — same text never hits API twice.
     """
     if openai_client and APP_URL:
         key = hashlib.md5(text.encode()).hexdigest()
@@ -149,14 +181,8 @@ def say(response, text):
 def play_filler(response):
     """Play a filler phrase instantly while GPT processes."""
     import random
-    filler = random.choice(FILLERS)
-    if openai_client and APP_URL:
-        key = hashlib.md5(filler.encode()).hexdigest()
-        if key in audio_cache:
-            text_cache[key] = filler
-            response.play(APP_URL + "/audio/" + key)
-            return
-    response.say(filler, voice="Polly.Joanna", language=LANGUAGE)
+    key = random.choice(FILLER_KEYS)
+    static_say(response, key)
 
 
 @app.route("/audio/<key>", methods=["GET"])
@@ -226,7 +252,6 @@ def yes_no_answer(text):
 
 
 def is_emergency(text):
-    """Instant keyword check — no GPT needed, fires in microseconds."""
     if not text:
         return False
     t = text.lower()
@@ -242,7 +267,6 @@ def is_emergency(text):
 
 
 def is_likely_landline(phone_number):
-    """Detect landline — ask for mobile number to send SMS."""
     if not phone_number or phone_number == "Unknown":
         return True
     cleaned = phone_number.replace("+", "").replace("-", "").replace(" ", "")
@@ -252,7 +276,6 @@ def is_likely_landline(phone_number):
 
 
 def parse_spoken_number(text):
-    """Convert spoken phone number to E.164 format."""
     if not text:
         return ""
     word_to_digit = {
@@ -279,21 +302,13 @@ def parse_spoken_number(text):
 # ==============================================================================
 
 def gpt_extract_name(speech):
-    """
-    Extract clean name from messy speech.
-    'Uhh yeah this is Mike sorry I am driving' -> 'Mike'
-    Caches results. Falls back to rule-based if GPT unavailable.
-    """
     if not speech:
         return ""
-
     cache_key = speech.lower().strip()
     if cache_key in gpt_name_cache:
         return gpt_name_cache[cache_key]
-
     if not openai_client:
         return _rule_extract_name(speech)
-
     try:
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -324,7 +339,6 @@ def gpt_extract_name(speech):
 
 
 def _rule_extract_name(value):
-    """Rule-based name extraction fallback."""
     if not value:
         return ""
     text = value.strip()
@@ -345,22 +359,13 @@ def _rule_extract_name(value):
 
 
 def gpt_extract_service_and_score(speech):
-    """
-    Identify service type AND lead score in one GPT call.
-    Returns (service, score) tuple.
-    Score: HIGH ($500+), MEDIUM ($150-500), LOW (under $150), EMERGENCY
-    Caches results.
-    """
     if not speech:
         return clean_text(speech), "MEDIUM"
-
     cache_key = speech.lower().strip()
     if cache_key in gpt_service_cache:
         return gpt_service_cache[cache_key]
-
     if not openai_client:
         return clean_text(speech), "MEDIUM"
-
     try:
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -405,10 +410,6 @@ def gpt_extract_service_and_score(speech):
 
 
 def gpt_build_lead_summary(name, service, intent, urgency, details, caller, score):
-    """
-    Build elite dollar-focused lead summary.
-    HIGH VALUE: John needs full water heater replacement (~$2800). Call him back first.
-    """
     if not openai_client:
         return None
     try:
@@ -482,7 +483,6 @@ def send_lead_alert(name, caller, service, urgency, intent, details, score):
         return
     summary = gpt_build_lead_summary(name, service, intent, urgency, details, caller, score)
     urgency_flag = "URGENT" if urgency == "Urgent" else "Standard"
-
     if summary:
         body = (
             "New Lead - NextReceptionist\n\n"
@@ -533,31 +533,17 @@ def send_emergency_sms(caller, speech):
 
 
 # ==============================================================================
-# EMERGENCY RESPONSE — live dial to owner
+# EMERGENCY RESPONSE
 # ==============================================================================
 
 def emergency_response(response, caller, speech):
-    """
-    Immediate emergency handler.
-    1. Plays pre-recorded message instantly
-    2. Live dials owner so caller reaches a real person
-    3. SMS alert fires to owner
-    """
     send_emergency_sms(caller, speech)
-    say(response, (
-        "I understand this is an emergency. "
-        "I am connecting you with a technician right now. "
-        "Please stay on the line. If this is life threatening call 911 immediately."
-    ))
+    static_say(response, "emergency_msg")          # Pre-cached — instant
     if OWNER_PHONE:
         dial = Dial(action="/call_ended", method="POST", timeout=30)
         dial.number(OWNER_PHONE)
         response.append(dial)
-        say(response, (
-            "We were unable to reach a technician directly. "
-            "Someone will call you back within minutes. "
-            "If this is life threatening please call 911 immediately. Goodbye."
-        ))
+        static_say(response, "emergency_no_answer") # Pre-cached — instant
     response.hangup()
     return str(response)
 
@@ -596,11 +582,10 @@ ensure_csv_exists()
 
 
 # ==============================================================================
-# NO-SHOW SAVER — APScheduler confirmation calls
+# NO-SHOW SAVER
 # ==============================================================================
 
 def make_confirmation_call(customer_phone, customer_name, appointment_time, calendly_link):
-    """Make outbound day-before confirmation call."""
     try:
         if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, APP_URL]):
             print("Missing credentials for confirmation call")
@@ -625,7 +610,6 @@ def make_confirmation_call(customer_phone, customer_name, appointment_time, cale
 
 
 def schedule_confirmation_call(customer_phone, customer_name, appointment_dt, calendly_link):
-    """Schedule confirmation call for 10 AM the day before via APScheduler."""
     try:
         call_time = appointment_dt - timedelta(days=1)
         call_time = call_time.replace(hour=10, minute=0, second=0, microsecond=0)
@@ -659,18 +643,14 @@ def home():
 
 @app.route("/voice", methods=["GET", "POST"])
 def voice():
-    """Greeting — emergency option first, then ask for name."""
+    """Greeting — pre-cached audio fires instantly."""
     response = VoiceResponse()
     gather = gather_speech(
         "/triage",
         hints="emergency, urgent, help, flooding, gas, fire, burst, my name is, first name",
         timeout="4"
     )
-    say(gather, (
-        "Thank you for calling. You've reached the service desk. "
-        "If this is an emergency please say emergency now. "
-        "Otherwise please tell us your name and we will be happy to help you."
-    ))
+    static_say(gather, "greeting")    # <500ms — pre-cached at startup
     response.append(gather)
     response.redirect("/voice")
     return str(response)
@@ -678,34 +658,25 @@ def voice():
 
 @app.route("/triage", methods=["POST"])
 def triage():
-    """
-    First response scanner — checks emergency before anything else.
-    Emergency fires in under 5 seconds. Normal callers flow to name.
-    """
-    response    = VoiceResponse()
-    speech      = request.values.get("SpeechResult", "")
-    caller      = request.values.get("From", "Unknown")
+    response = VoiceResponse()
+    speech   = request.values.get("SpeechResult", "")
+    caller   = request.values.get("From", "Unknown")
 
-    # Emergency check on very first words — instant keyword scan
     if is_emergency(speech):
         return emergency_response(response, caller, speech)
 
-    # Try to extract name from first response
-    # Many callers say "Hi my name is John" right away
     name = gpt_extract_name(speech) if speech else ""
 
     if name:
         next_url = build_url("/get_service", name=name, caller=caller)
         gather   = gather_speech(next_url, hints=GENERAL_HINTS)
-        say(gather, (
-            "Thanks " + name + ". What type of service do you need today? "
-            "For example plumbing, HVAC, electrical, or roofing."
-        ))
+        # Dynamic — uses name, must use say()
+        say(gather, "Thanks " + name + ". What type of service do you need today? For example plumbing, HVAC, electrical, or roofing.")
         response.append(gather)
         response.redirect(next_url)
     else:
         gather = gather_speech("/get_name", hints="my name is, first name, last name", timeout="3")
-        say(gather, "What is your full name please?")
+        static_say(gather, "ask_name")    # Pre-cached — instant
         response.append(gather)
         response.redirect("/get_name")
 
@@ -722,28 +693,25 @@ def get_name():
     if is_emergency(speech):
         return emergency_response(response, caller, speech)
 
-    # Play filler while GPT extracts name
-    play_filler(response)
+    play_filler(response)    # Instant — pre-cached
     name = gpt_extract_name(speech) if speech else ""
 
     if not name:
         if retries >= MAX_RETRIES:
-            say(response, "I am having trouble hearing you. Please call back and we will be happy to help. Goodbye.")
+            static_say(response, "cant_hear")    # Pre-cached
             response.hangup()
             return str(response)
         retry_url = build_url("/get_name", retries=retries + 1)
         gather    = gather_speech(retry_url, hints="my name is, first name, last name", timeout="3")
-        say(gather, "I didn't catch your name. Could you please say your full name?")
+        static_say(gather, "retry_name")         # Pre-cached
         response.append(gather)
         response.redirect(retry_url)
         return str(response)
 
     next_url = build_url("/get_service", name=name, caller=caller)
     gather   = gather_speech(next_url, hints=GENERAL_HINTS)
-    say(gather, (
-        "Thanks " + name + ". What type of service do you need today? "
-        "For example plumbing, HVAC, electrical, or roofing."
-    ))
+    # Dynamic — uses name, must use say()
+    say(gather, "Thanks " + name + ". What type of service do you need today? For example plumbing, HVAC, electrical, or roofing.")
     response.append(gather)
     response.redirect(next_url)
     return str(response)
@@ -760,11 +728,9 @@ def get_service():
     if is_emergency(speech):
         return emergency_response(response, caller, speech)
 
-    # Play filler while GPT identifies service and scores lead
-    play_filler(response)
+    play_filler(response)    # Instant — pre-cached
     service, score = gpt_extract_service_and_score(speech) if speech else ("", "MEDIUM")
 
-    # Short-circuit: service + panic keyword = emergency
     PANIC_COMBOS = {
         "Plumbing":   ["flood", "burst", "flooding", "gushing", "water everywhere"],
         "HVAC":       ["gas", "gas smell", "carbon monoxide", "explosion"],
@@ -780,18 +746,19 @@ def get_service():
 
     if not service:
         if retries >= MAX_RETRIES:
-            say(response, "I am having trouble hearing you. Please call back and we will be happy to help. Goodbye.")
+            static_say(response, "cant_hear")    # Pre-cached
             response.hangup()
             return str(response)
         retry_url = build_url("/get_service", name=name, caller=caller, retries=retries + 1)
         gather    = gather_speech(retry_url, hints=GENERAL_HINTS)
-        say(gather, "I didn't catch that. Please tell me the type of service you need, like plumbing, HVAC, or electrical.")
+        static_say(gather, "retry_service")      # Pre-cached
         response.append(gather)
         response.redirect(retry_url)
         return str(response)
 
     confirm_url = build_url("/confirm_service", name=name, service=service, caller=caller, score=score)
     gather      = gather_speech(confirm_url, hints="yes, no, yeah, nope, correct, wrong", timeout="3")
+    # Dynamic — uses service name, must use say()
     say(gather, "Got it, you need " + service + ". Is that correct? Please say yes or no.")
     response.append(gather)
     response.redirect(confirm_url)
@@ -813,7 +780,7 @@ def confirm_service():
     if answer == "yes":
         next_url = build_url("/get_intent", name=name, service=service, caller=caller, score=score)
         gather   = gather_speech(next_url, hints=GENERAL_HINTS, timeout="4")
-        say(gather, "Great. Can you briefly describe what is going on and what you need help with?")
+        static_say(gather, "ask_intent")         # Pre-cached — instant
         response.append(gather)
         response.redirect(next_url)
         return str(response)
@@ -821,19 +788,19 @@ def confirm_service():
     if answer == "no":
         next_url = build_url("/get_service", name=name, caller=caller)
         gather   = gather_speech(next_url, hints=GENERAL_HINTS)
-        say(gather, "No problem. What type of service do you need?")
+        static_say(gather, "no_problem_service") # Pre-cached — instant
         response.append(gather)
         response.redirect(next_url)
         return str(response)
 
     if retries >= MAX_RETRIES:
-        say(response, "I am having trouble hearing you. Please call back and we will be happy to help. Goodbye.")
+        static_say(response, "cant_hear")
         response.hangup()
         return str(response)
 
     retry_url = build_url("/confirm_service", name=name, service=service, caller=caller, score=score, retries=retries + 1)
     gather    = gather_speech(retry_url, hints="yes, no", timeout="3")
-    say(gather, "Sorry, I didn't catch that. Please say yes or no.")
+    static_say(gather, "retry_confirm")          # Pre-cached — instant
     response.append(gather)
     response.redirect(retry_url)
     return str(response)
@@ -852,24 +819,24 @@ def get_intent():
     if is_emergency(speech):
         return emergency_response(response, caller, speech)
 
-    play_filler(response)
+    play_filler(response)    # Instant
     intent = clean_text(speech)
 
     if not intent:
         if retries >= MAX_RETRIES:
-            say(response, "I am having trouble hearing you. Please call back and we will be happy to help. Goodbye.")
+            static_say(response, "cant_hear")
             response.hangup()
             return str(response)
         retry_url = build_url("/get_intent", name=name, service=service, caller=caller, score=score, retries=retries + 1)
         gather    = gather_speech(retry_url, hints=GENERAL_HINTS, timeout="4")
-        say(gather, "I didn't catch that. Could you briefly describe what you need help with?")
+        static_say(gather, "retry_intent")       # Pre-cached — instant
         response.append(gather)
         response.redirect(retry_url)
         return str(response)
 
     next_url = build_url("/get_urgency", name=name, service=service, intent=intent, caller=caller, score=score)
     gather   = gather_speech(next_url, hints="yes, no, urgent, not urgent, emergency", timeout="3")
-    say(gather, "Thank you. Is this an urgent or emergency situation? Please say yes or no.")
+    static_say(gather, "ask_urgency")            # Pre-cached — instant
     response.append(gather)
     response.redirect(next_url)
     return str(response)
@@ -895,19 +862,19 @@ def get_urgency():
         urgency = "Not Urgent"
     else:
         if retries >= MAX_RETRIES:
-            say(response, "I am having trouble hearing you. Please call back and we will be happy to help. Goodbye.")
+            static_say(response, "cant_hear")
             response.hangup()
             return str(response)
         retry_url = build_url("/get_urgency", name=name, service=service, intent=intent, caller=caller, score=score, retries=retries + 1)
         gather    = gather_speech(retry_url, hints="yes, no, urgent, not urgent", timeout="3")
-        say(gather, "Sorry, please say yes if it is urgent or no if it is not.")
+        static_say(gather, "retry_urgency")      # Pre-cached — instant
         response.append(gather)
         response.redirect(retry_url)
         return str(response)
 
     next_url = build_url("/get_details", name=name, service=service, intent=intent, urgency=urgency, caller=caller, score=score)
     gather   = gather_speech(next_url, hints=GENERAL_HINTS, timeout="4")
-    say(gather, "Got it. Finally, please share any additional details you would like us to know.")
+    static_say(gather, "ask_details")            # Pre-cached — instant
     response.append(gather)
     response.redirect(next_url)
     return str(response)
@@ -926,10 +893,8 @@ def get_details():
 
     details = clean_text(speech) or "No extra details provided"
 
-    # Play filler instantly while CSV, GPT summary, and SMS all process
-    play_filler(response)
+    play_filler(response)    # Instant while background tasks run
 
-    # Check for landline — ask for mobile number to send SMS
     if is_likely_landline(caller):
         next_url = build_url(
             "/get_mobile",
@@ -937,7 +902,7 @@ def get_details():
             intent=intent, urgency=urgency, details=details, score=score
         )
         gather = gather_speech(next_url, hints="my number is, cell, mobile", timeout="4")
-        say(gather, "Thank you. One last thing. What is the best mobile number to send your booking link to? Please say your ten digit number.")
+        static_say(gather, "ask_mobile")         # Pre-cached — instant
         response.append(gather)
         response.redirect(next_url)
         return str(response)
@@ -946,6 +911,7 @@ def get_details():
     send_lead_alert(name, caller, service, urgency, intent, details, score)
     send_booking_sms(caller, name, service)
 
+    # Dynamic goodbye — uses name and service, must use say()
     say(response, (
         "Perfect, we have everything we need. "
         "Thank you " + name + ". I am sending a text message to your phone right now "
@@ -958,7 +924,6 @@ def get_details():
 
 @app.route("/get_mobile", methods=["POST"])
 def get_mobile():
-    """Collect mobile number from landline callers."""
     response = VoiceResponse()
     speech   = request.values.get("SpeechResult", "")
     name     = request.args.get("name", "")
@@ -976,7 +941,7 @@ def get_mobile():
         if retries >= MAX_RETRIES:
             append_to_csv(name, caller, service, intent, urgency, details, score)
             send_lead_alert(name, caller, service, urgency, intent, details, score)
-            say(response, "I was unable to get your number. We will follow up with you soon. Goodbye.")
+            static_say(response, "no_mobile")    # Pre-cached
             response.hangup()
             return str(response)
         retry_url = build_url(
@@ -986,7 +951,7 @@ def get_mobile():
             retries=retries + 1
         )
         gather = gather_speech(retry_url, hints="my number is, cell, mobile", timeout="4")
-        say(gather, "I didn't catch that number. Could you please say your ten digit mobile number?")
+        static_say(gather, "retry_mobile")       # Pre-cached — instant
         response.append(gather)
         response.redirect(retry_url)
         return str(response)
@@ -995,6 +960,7 @@ def get_mobile():
     send_lead_alert(name, mobile, service, urgency, intent, details, score)
     send_booking_sms(mobile, name, service)
 
+    # Dynamic goodbye — uses name and service, must use say()
     say(response, (
         "Perfect, thank you " + name + ". We have received your request for " + service + ". "
         "I am sending a text message to your phone right now with a link to book your appointment. "
@@ -1086,11 +1052,6 @@ def confirm_response():
 
 @app.route("/calendly-webhook", methods=["POST"])
 def calendly_webhook():
-    """
-    Triggered when customer books via Calendly.
-    Set in Calendly: Integrations -> Webhooks -> invitee.created
-    URL: https://your-app.onrender.com/calendly-webhook
-    """
     try:
         data     = request.get_json(silent=True) or {}
         payload  = data.get("payload", {})
