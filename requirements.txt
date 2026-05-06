@@ -3,3 +3,4 @@ twilio
 openai
 gunicorn
 apscheduler
+elevenlabs
