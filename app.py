@@ -340,21 +340,31 @@ def gpt_build_lead_summary(name, service, issue, urgency, details, score):
 
 def extract_data_from_transcript(transcript_text, data_collection):
     """
-    ElevenLabs sends structured data_collection from the agent.
-    This maps their field names to our CSV columns.
-    Falls back to GPT extraction if agent fields are missing.
+    ElevenLabs sends data_collection as a dict where each key contains
+    a nested object like: { "value": "John Smith", "rationale": "..." }
+    We need to extract the "value" from each field.
     """
-    name    = data_collection.get("caller_name", "")
-    service = data_collection.get("service_type", "")
-    issue   = data_collection.get("issue_description", "")
-    urgency = data_collection.get("urgency", "Not Urgent")
-    details = data_collection.get("additional_details", "")
-    mobile  = data_collection.get("mobile_number", "")
-    score   = data_collection.get("lead_score", "MEDIUM")
+    def get_value(field):
+        """Extract value from ElevenLabs data collection field."""
+        raw = data_collection.get(field, {})
+        if isinstance(raw, dict):
+            return raw.get("value", "") or ""
+        return str(raw) if raw else ""
+
+    name    = get_value("caller_name")
+    service = get_value("service_type")
+    issue   = get_value("issue_description")
+    urgency = get_value("urgency") or "Not Urgent"
+    details = get_value("additional_details")
+    mobile  = get_value("mobile_number")
+    score   = get_value("lead_score") or "MEDIUM"
 
     # Normalize score
     if score not in ("HIGH", "MEDIUM", "LOW"):
         score = "MEDIUM"
+
+    log.info("Extracted — Name: %s | Service: %s | Urgency: %s | Score: %s",
+             name, service, urgency, score)
 
     return name, service, issue, urgency, details, mobile, score
 
@@ -486,21 +496,34 @@ def post_call_webhook():
         analysis        = data.get("analysis", {})
         metadata        = data.get("metadata", {})
 
-        # Pull caller info from Twilio metadata ElevenLabs passes through
-        twilio_meta     = metadata.get("twilio", {})
-        caller_phone    = twilio_meta.get("caller_id", "Unknown")
-        duration        = metadata.get("call_duration_secs", 0)
+        # Pull caller phone from multiple possible locations in payload
+        twilio_meta  = metadata.get("twilio", {})
+        caller_phone = (
+            twilio_meta.get("caller_id")
+            or twilio_meta.get("From")
+            or data.get("caller_id")
+            or "Unknown"
+        )
+        duration = metadata.get("call_duration_secs", 0)
 
-        log.info("Post-call webhook received | Conversation: %s | Duration: %ss",
-                 conversation_id, duration)
+        log.info("Post-call webhook received | Conversation: %s | Duration: %ss | Caller: %s",
+                 conversation_id, duration, caller_phone)
+
+        # Log full payload for debugging
+        log.info("Data collection raw: %s", data_collection)
+        log.info("Metadata raw: %s", metadata)
 
         # Extract structured data the agent collected during the call
         name, service, issue, urgency, details, mobile, score = extract_data_from_transcript(
             transcript, data_collection
         )
 
-        # Use caller_phone as SMS target if mobile not collected
-        sms_target = mobile if mobile else caller_phone
+        # Use mobile if collected, otherwise fall back to caller_phone
+        sms_target    = mobile if mobile and mobile != "Unknown" else caller_phone
+        service_label = service if service else "home service"
+        name_label    = name if name else "there"
+
+        log.info("SMS target: %s | Name: %s | Service: %s", sms_target, name_label, service_label)
 
         # Emergency handling — alert fires immediately
         if urgency == "Emergency":
@@ -518,10 +541,11 @@ def post_call_webhook():
         )
         executor.submit(
             send_lead_alert,
-            name, caller_phone, service, urgency, issue, details, score, summary
+            name_label, caller_phone, service_label, urgency, issue, details, score, summary
         )
-        if sms_target and sms_target != "Unknown" and service:
-            executor.submit(send_booking_sms, sms_target, name, service)
+        # Always send booking SMS as long as we have a valid phone number
+        if sms_target and sms_target != "Unknown":
+            executor.submit(send_booking_sms, sms_target, name_label, service_label)
 
         return jsonify({"status": "ok"}), 200
 
