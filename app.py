@@ -485,8 +485,12 @@ def post_call_webhook():
         payload         = request.get_json(silent=True) or {}
         event_type      = payload.get("type", "")
 
+        log.info("Webhook event type: %s | Full payload keys: %s",
+                 event_type, list(payload.keys()))
+
         # We only care about transcription webhooks
         if event_type != "post_call_transcription":
+            log.info("Ignoring event type: %s", event_type)
             return jsonify({"status": "ignored"}), 200
 
         data            = payload.get("data", {})
@@ -496,10 +500,12 @@ def post_call_webhook():
         analysis        = data.get("analysis", {})
         metadata        = data.get("metadata", {})
 
-        # Pull caller phone from multiple possible locations in payload
+        # Pull caller phone — ElevenLabs puts it in metadata.phone_call.external_number
+        phone_call   = metadata.get("phone_call", {})
         twilio_meta  = metadata.get("twilio", {})
         caller_phone = (
-            twilio_meta.get("caller_id")
+            phone_call.get("external_number")
+            or twilio_meta.get("caller_id")
             or twilio_meta.get("From")
             or data.get("caller_id")
             or "Unknown"
